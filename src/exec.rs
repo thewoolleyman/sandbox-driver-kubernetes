@@ -25,8 +25,8 @@ use kube::api::{Api, AttachParams, AttachedProcess};
 use sandbox_driver::{
     BASH_ENV_VAR, Error, Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult,
     OutputCaptureBuffer, OutputSanitization, OutputSanitizer, OutputSink, OutputStream, Result,
-    SpawnSpec, StderrTail, StdioProcess, StdioProcessHandle, StopLevel, Termination, feed_stdin,
-    finish_stdin_writer, run_with_stop_grace,
+    SpawnSpec, StderrTail, StdioProcess, StdioProcessHandle, StopLevel, Termination,
+    TransportError, feed_stdin, finish_stdin_writer, run_with_stop_grace,
 };
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, duplex};
 use tokio::sync::{mpsc, watch};
@@ -433,6 +433,16 @@ impl KubernetesExec {
         };
         if truncated {
             process.abort();
+        }
+        // A command that ran to its end always reports a status. A stream
+        // that ended with none never reached the command's end: the pod or
+        // its node became unreachable. Report that, never a clean exit.
+        if exit_code.is_none() && !truncated && outcome.termination == Termination::Exited {
+            return Err(self
+                .diagnose(Error::Transport(TransportError::new(
+                    "the exec stream ended without an exit status; the sandbox became unreachable",
+                )))
+                .await);
         }
         Ok(captured.into_result(outcome.termination, exit_code, started.elapsed(), truncated))
     }

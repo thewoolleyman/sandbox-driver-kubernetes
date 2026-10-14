@@ -395,7 +395,30 @@ async fn a_rotated_kubeconfig_is_reread_on_401() {
         .delete(name, &DeleteParams::default())
         .await
         .expect("deletes the service account");
-    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    // The API server caches a successful token authentication briefly, so
+    // wait until the old credential is genuinely rejected before rotating.
+    let stale = KubernetesProvider::connect({
+        let mut stale = admin_config.clone();
+        stale.kubeconfig = kubeconfig.clone();
+        stale.state_dir =
+            std::env::temp_dir().join(format!("sdk-test-stale-{}", std::process::id()));
+        stale
+    })
+    .await
+    .expect("connects with the old token");
+    let mut rejected = false;
+    for _ in 0..60 {
+        let health = stale.health().await.expect("health");
+        if health.status == sandbox_driver::HealthStatus::Unauthorized {
+            rejected = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+    assert!(
+        rejected,
+        "the old token is rejected once its service account is gone"
+    );
     let token = mint_service_account(client.clone(), name).await;
     write_kubeconfig(&admin_config.kubeconfig, &kubeconfig, &token);
 
