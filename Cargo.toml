@@ -1,0 +1,45 @@
+[package]
+name = "sandbox-driver-kubernetes"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "Kubernetes sandbox provider for sandbox-driver (protocol v2): sandboxes run as pods on a self-hosted cluster"
+repository = "https://github.com/thewoolleyman/sandbox-driver-kubernetes"
+publish = false
+
+[[bin]]
+name = "sandbox-driver-kubernetes"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+futures-util = "0.3"
+k8s-openapi = { version = "0.28", features = ["v1_33"] }
+kube = { version = "4.2", default-features = false, features = ["client", "config", "rustls-tls", "ring", "ws"] }
+rand = "0.9"
+sandbox-driver = { git = "https://github.com/lithoscomputer/sandbox-driver", rev = "90b0d825767105d4b42e59fdbd116c4d66b87d83" }
+sandbox-driver-protocol = { git = "https://github.com/lithoscomputer/sandbox-driver", rev = "90b0d825767105d4b42e59fdbd116c4d66b87d83" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "rt", "rt-multi-thread", "sync", "time"] }
+tokio-util = "0.7"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+k8s-openapi = { version = "0.28", features = ["v1_33"] }
+kube = { version = "4.2", default-features = false, features = ["client", "config", "rustls-tls", "ring", "ws"] }
+serde_json = "1"
+sandbox-driver-conformance = { git = "https://github.com/lithoscomputer/sandbox-driver", rev = "90b0d825767105d4b42e59fdbd116c4d66b87d83" }
+tokio = { version = "1", features = ["io-util", "macros", "rt-multi-thread"] }
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"

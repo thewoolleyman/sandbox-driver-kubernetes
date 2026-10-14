@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-and-unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --lib
+
+  cluster:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: helm/kind-action@v1.12.0
+        with:
+          cluster_name: sdk
+          config: ci/kind.yaml
+          kubeconfig: /home/runner/.kube/kind-sdk
+      - name: Pre-pull the test image into the node
+        run: |
+          docker pull ghcr.io/lithoscomputer/ubuntu-24.04:slim-df708f910111
+          kind load docker-image ghcr.io/lithoscomputer/ubuntu-24.04:slim-df708f910111 --name sdk
+      - name: Cluster tests
+        env:
+          SANDBOX_DRIVER_KUBERNETES_TEST_KUBECONFIG: /home/runner/.kube/kind-sdk
+          RUST_LOG: sandbox_driver_kubernetes=debug
+        run: cargo test --tests -- --nocapture --test-threads 1
