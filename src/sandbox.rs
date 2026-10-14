@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use k8s_openapi::api::core::v1::Pod;
 use kube::api::{Api, Patch, PatchParams};
 use sandbox_driver::{
-    Action, Capabilities, DerivedFs, Error, EventEmitter, EventSubject, Exec, ExecSpec, Filesystem,
+    Action, Capabilities, Error, EventEmitter, EventSubject, Exec, ExecSpec, Filesystem,
     NetworkPolicy, PlatformInfo, Result, Sandbox, SandboxId, SandboxKind, SandboxState,
     SandboxStatus,
 };
@@ -16,6 +16,7 @@ use tokio::sync::Mutex;
 
 use crate::error::{kube_error, provider, record_io};
 use crate::exec::{KubernetesExec, shell_quote};
+use crate::fs::KubernetesFs;
 use crate::pod::{
     Cluster, Incarnation, NodeHealth, build_network_policy, build_pod, node_unavailable,
     object_labels,
@@ -39,7 +40,7 @@ pub struct KubernetesSandbox {
     pub(crate) record: Mutex<Record>,
     pub(crate) working_dir: String,
     pub(crate) exec: Arc<KubernetesExec>,
-    pub(crate) fs: DerivedFs,
+    pub(crate) fs: KubernetesFs,
     pub(crate) timeouts: Timeouts,
     pub(crate) events: EventEmitter,
 }
@@ -61,7 +62,7 @@ impl KubernetesSandbox {
             record.working_dir.clone(),
             record.node.clone(),
         ));
-        let fs = DerivedFs::new(Arc::clone(&exec) as Arc<dyn Exec>);
+        let fs = KubernetesFs::new(Arc::clone(&exec) as Arc<dyn Exec>);
         Ok(Self {
             id,
             capabilities,

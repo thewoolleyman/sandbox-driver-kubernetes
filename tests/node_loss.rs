@@ -6,6 +6,11 @@
 //! Docker container, whose kubelet the test stops and restarts. It runs last
 //! (test binaries run in name order) because it takes the node down.
 
+#![allow(
+    clippy::field_reassign_with_default,
+    reason = "non_exhaustive driver types are built field by field"
+)]
+
 mod support;
 
 use std::process::Command;

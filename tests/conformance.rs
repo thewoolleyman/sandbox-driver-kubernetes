@@ -6,6 +6,11 @@
 //! `sandbox-driver-kubernetes/factory=true` (CI uses kind with
 //! `ci/kind.yaml`). The tests pass trivially when it is unset.
 
+#![allow(
+    clippy::field_reassign_with_default,
+    reason = "non_exhaustive driver types are built field by field"
+)]
+
 mod support;
 
 use std::sync::Arc;

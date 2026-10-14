@@ -4,6 +4,11 @@
 //! Gated on `SANDBOX_DRIVER_KUBERNETES_TEST_KUBECONFIG`, like the
 //! conformance tests. Run with `--test-threads 1`.
 
+#![allow(
+    clippy::field_reassign_with_default,
+    reason = "non_exhaustive driver types are built field by field"
+)]
+
 mod support;
 
 use std::collections::BTreeMap;

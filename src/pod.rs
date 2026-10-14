@@ -142,7 +142,12 @@ pub(crate) fn build_pod(record: &Record, incarnation: Incarnation) -> Result<Pod
         .and_then(|user| user.parse::<i64>().ok());
     // The idle process ends promptly on TERM, so deleting the pod does not
     // wait out a grace period on a PID 1 that ignores signals.
-    let idle = "trap 'exit 0' TERM INT; while :; do sleep 3600 & wait $!; done".to_owned();
+    let idle = format!(
+        "mkdir -p {runtime} && chmod 0700 {parent} {runtime} && \
+         trap 'exit 0' TERM INT; while :; do sleep 3600 & wait $!; done",
+        parent = crate::exec::shell_quote(crate::RUNTIME_DIRECTORY_PARENT),
+        runtime = crate::exec::shell_quote(crate::RUNTIME_DIRECTORY),
+    );
     Ok(Pod {
         metadata: ObjectMeta {
             name: Some(record.id.clone()),

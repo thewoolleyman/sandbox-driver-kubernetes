@@ -44,6 +44,7 @@ mod client;
 mod config;
 mod error;
 mod exec;
+mod fs;
 mod labels;
 mod pod;
 mod provider;
@@ -53,6 +54,7 @@ mod sandbox;
 pub use crate::client::KubeClient;
 pub use crate::config::KubernetesConfig;
 pub use crate::exec::KubernetesExec;
+pub use crate::fs::KubernetesFs;
 pub use crate::labels::{decode_label_value, encode_label_value, is_valid_label_value};
 pub use crate::provider::KubernetesProvider;
 pub use crate::record::{Record, RecordStore};
@@ -74,6 +76,8 @@ pub const CONTAINER_NAME: &str = "sandbox";
 pub const DEFAULT_WORKING_DIRECTORY: &str = "/workspace";
 /// Directory for the exec wrapper's control files inside the container.
 pub const RUNTIME_DIRECTORY: &str = "/tmp/sandbox-driver/runtime";
+/// Parent of [`RUNTIME_DIRECTORY`], also kept private.
+pub const RUNTIME_DIRECTORY_PARENT: &str = "/tmp/sandbox-driver";
 
 pub(crate) fn kubernetes_kind() -> ProviderKind {
     ProviderKind::try_new(PROVIDER_KIND).expect("static kind is valid")
