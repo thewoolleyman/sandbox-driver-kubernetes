@@ -42,4 +42,4 @@ jobs:
           SANDBOX_DRIVER_KUBERNETES_TEST_KUBECONFIG: /home/runner/.kube/kind-sdk
           SANDBOX_DRIVER_KUBERNETES_TEST_KIND_NODE: sdk-control-plane
           RUST_LOG: sandbox_driver_kubernetes=debug
-        run: cargo test --tests -- --nocapture --test-threads 1
+        run: cargo test --tests --no-fail-fast -- --nocapture --test-threads 1

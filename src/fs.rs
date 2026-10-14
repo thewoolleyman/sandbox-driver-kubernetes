@@ -85,6 +85,14 @@ impl Filesystem for KubernetesFs {
 
     async fn read_range(&self, path: &str, offset: u64, length: Option<u64>) -> Result<Vec<u8>> {
         match self.derived.read_range(path, offset, length).await {
+            // An empty range is also what a missing file reads as; tell
+            // the two apart.
+            Ok(bytes) if bytes.is_empty() && !self.derived.exists(path).await? => {
+                Err(Error::NotFound {
+                    resource: ResourceKind::File,
+                    id: path.to_owned(),
+                })
+            }
             Ok(bytes) => Ok(bytes),
             Err(error) => Err(self.not_found_or(path, error).await),
         }
