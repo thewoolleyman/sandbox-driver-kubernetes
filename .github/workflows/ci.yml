@@ -40,5 +40,6 @@ jobs:
       - name: Cluster tests
         env:
           SANDBOX_DRIVER_KUBERNETES_TEST_KUBECONFIG: /home/runner/.kube/kind-sdk
+          SANDBOX_DRIVER_KUBERNETES_TEST_KIND_NODE: sdk-control-plane
           RUST_LOG: sandbox_driver_kubernetes=debug
         run: cargo test --tests -- --nocapture --test-threads 1
