@@ -27,6 +27,13 @@ pub struct KubernetesConfig {
     pub node_selector: BTreeMap<String, String>,
     /// Taints sandbox pods tolerate, so a tainted factory node can take them.
     pub tolerations: Vec<Toleration>,
+    /// A node-loaded AppArmor profile the sandbox pods run under
+    /// (`Localhost`), instead of the runtime default. On hosts whose kernel
+    /// stacks an exec'd process as `<profile>//&unconfined`, the runtime
+    /// default denies signals between a sandbox's own processes, so exec can
+    /// neither finish nor stop; a profile whose signal peers include the
+    /// stacked label fixes that without dropping confinement.
+    pub apparmor_localhost_profile: Option<String>,
     /// Directory on each worker node that holds sandbox workspaces.
     pub workspace_root: String,
     /// Host directory for the per-sandbox records.
@@ -73,6 +80,7 @@ impl Default for KubernetesConfig {
                 "true".to_owned(),
             )]),
             tolerations: Vec::new(),
+            apparmor_localhost_profile: None,
             workspace_root: "/var/lib/sandbox-driver-kubernetes/workspaces".to_owned(),
             state_dir: home
                 .join(".local")
@@ -207,5 +215,12 @@ mod tests {
         assert_eq!(parsed.tolerations[0].key.as_deref(), Some("node-role/ci"));
         assert_eq!(parsed.tolerations[0].effect.as_deref(), Some("NoSchedule"));
         assert!(toml::from_str::<KubernetesConfig>("[[tolerations]]\nbogus = 1\n").is_err());
+        let profiled: KubernetesConfig =
+            toml::from_str("apparmor_localhost_profile = \"ci-runner-workflow\"\n")
+                .expect("parses");
+        assert_eq!(
+            profiled.apparmor_localhost_profile.as_deref(),
+            Some("ci-runner-workflow")
+        );
     }
 }

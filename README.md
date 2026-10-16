@@ -62,6 +62,11 @@ factory = "hp"                              # sets the livespec.dispatch.factory
 refresh_command = ["sudo", "-n", "/usr/local/bin/refresh-factory-kubeconfig"]
 refresh_timeout_secs = 60
 
+# A node-loaded AppArmor profile for sandbox pods. Needed where the kernel stacks an
+# exec'd process as `<profile>//&unconfined` (e.g. Ubuntu 26.04): the runtime default
+# then denies signals between a sandbox's own processes, so exec never finishes.
+apparmor_localhost_profile = "ci-runner-workflow"
+
 # Taints sandbox pods tolerate, in Kubernetes field names.
 [[tolerations]]
 key = "node-role/ci"
