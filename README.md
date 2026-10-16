@@ -83,6 +83,15 @@ and, cluster-scoped, `nodes` get (the `NotReady` check). Check a subresource wit
 `kubectl auth can-i get pods --subresource=exec`, not `can-i get pods/exec`, which kubectl
 reads as a pod named `exec`. The cluster tests run the plugin under exactly this Role.
 
+## Lifecycle proof driver
+
+`sandbox-driver-kubernetes-proof <reboot|node-loss> --sha256 <plugin digest> --node <node>` launches
+the installed plugin exactly as a Fabro/Petri worker does (checksum-verified, one long-lived
+process), creates a sandbox on `<node>`, writes a marker into its workspace, and reports health,
+state and an exec probe every 15 s while an operator reboots the control plane or takes the node
+away. `reboot` then starts the sandbox again and passes only if the marker survived on the same
+node. It changes nothing in the cluster except through the plugin. Released beside the plugin.
+
 ## Development
 
 ```sh
