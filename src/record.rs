@@ -15,6 +15,8 @@ use std::path::{Path, PathBuf};
 use sandbox_driver::{NetworkPolicy, Resources};
 use serde::{Deserialize, Serialize};
 
+use crate::config::Toleration;
+
 /// Everything needed to rebuild a sandbox's pod and network policy.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Record {
@@ -38,6 +40,10 @@ pub struct Record {
     pub user: Option<String>,
     /// The node labels the first pod must match.
     pub node_selector: BTreeMap<String, String>,
+    /// Taints every pod of the sandbox tolerates. Defaulted so records
+    /// written before the field existed still load.
+    #[serde(default)]
+    pub tolerations: Vec<Toleration>,
     pub service_account: Option<String>,
     pub image_pull_secrets: Vec<String>,
     pub factory: Option<String>,
@@ -151,6 +157,7 @@ mod tests {
             network: NetworkPolicy::default(),
             user: None,
             node_selector: BTreeMap::new(),
+            tolerations: Vec::new(),
             service_account: None,
             image_pull_secrets: Vec::new(),
             factory: None,

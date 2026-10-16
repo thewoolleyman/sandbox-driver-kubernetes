@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Where the plugin finds its cluster, where it puts sandboxes, and where it
 /// keeps its host-side records.
@@ -25,6 +25,8 @@ pub struct KubernetesConfig {
     pub namespace: String,
     /// Node labels a sandbox's first pod must match.
     pub node_selector: BTreeMap<String, String>,
+    /// Taints sandbox pods tolerate, so a tainted factory node can take them.
+    pub tolerations: Vec<Toleration>,
     /// Directory on each worker node that holds sandbox workspaces.
     pub workspace_root: String,
     /// Host directory for the per-sandbox records.
@@ -39,6 +41,24 @@ pub struct KubernetesConfig {
     pub start_timeout_secs: u64,
     /// Seconds `stop` waits for a pod to be gone from the API.
     pub stop_timeout_secs: u64,
+    /// A command (argv) that rewrites the kubeconfig file, run on a `401`
+    /// before the file is re-read. Empty when something else keeps the file
+    /// current.
+    pub refresh_command: Vec<String>,
+    /// Seconds the refresh command may run.
+    pub refresh_timeout_secs: u64,
+}
+
+/// One pod toleration, in the Kubernetes field names.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct Toleration {
+    pub key: Option<String>,
+    /// `Equal` or `Exists`; Kubernetes treats unset as `Equal`.
+    pub operator: Option<String>,
+    pub value: Option<String>,
+    /// `NoSchedule`, `PreferNoSchedule` or `NoExecute`; unset matches all.
+    pub effect: Option<String>,
 }
 
 impl Default for KubernetesConfig {
@@ -52,6 +72,7 @@ impl Default for KubernetesConfig {
                 "sandbox-driver-kubernetes/factory".to_owned(),
                 "true".to_owned(),
             )]),
+            tolerations: Vec::new(),
             workspace_root: "/var/lib/sandbox-driver-kubernetes/workspaces".to_owned(),
             state_dir: home
                 .join(".local")
@@ -62,6 +83,8 @@ impl Default for KubernetesConfig {
             factory: None,
             start_timeout_secs: 600,
             stop_timeout_secs: 120,
+            refresh_command: Vec::new(),
+            refresh_timeout_secs: 60,
         }
     }
 }
@@ -171,5 +194,18 @@ mod tests {
         assert_eq!(parsed.namespace, "x");
         assert_eq!(parsed.workspace_root, "/data/ws");
         assert!(toml::from_str::<KubernetesConfig>("bogus = 1\n").is_err());
+    }
+
+    #[test]
+    fn tolerations_and_a_refresh_command_parse_from_the_file() {
+        let parsed: KubernetesConfig = toml::from_str(
+            "refresh_command = [\"sudo\", \"-n\", \"/usr/local/bin/refresh-factory-kubeconfig\"]\n\
+             [[tolerations]]\nkey = \"node-role/ci\"\noperator = \"Equal\"\nvalue = \"factory\"\neffect = \"NoSchedule\"\n",
+        )
+        .expect("parses");
+        assert_eq!(parsed.refresh_command.len(), 3);
+        assert_eq!(parsed.tolerations[0].key.as_deref(), Some("node-role/ci"));
+        assert_eq!(parsed.tolerations[0].effect.as_deref(), Some("NoSchedule"));
+        assert!(toml::from_str::<KubernetesConfig>("[[tolerations]]\nbogus = 1\n").is_err());
     }
 }
