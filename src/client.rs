@@ -141,6 +141,27 @@ impl KubeClient {
     }
 }
 
+async fn build(path: &std::path::Path, context: Option<&str>) -> Result<Client, ClientError> {
+    let kubeconfig = Kubeconfig::read_from(path).map_err(|source| ClientError::Read {
+        path: path.to_owned(),
+        source,
+    })?;
+    let options = KubeConfigOptions {
+        context: context.map(str::to_owned),
+        ..KubeConfigOptions::default()
+    };
+    let config = Config::from_custom_kubeconfig(kubeconfig, &options)
+        .await
+        .map_err(|source| ClientError::Build {
+            path: path.to_owned(),
+            source: Box::new(source),
+        })?;
+    Client::try_from(config).map_err(|source| ClientError::Build {
+        path: path.to_owned(),
+        source: Box::new(source),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,25 +195,4 @@ mod tests {
         silent.run_refresh().await;
         std::fs::remove_dir_all(&dir).ok();
     }
-}
-
-async fn build(path: &std::path::Path, context: Option<&str>) -> Result<Client, ClientError> {
-    let kubeconfig = Kubeconfig::read_from(path).map_err(|source| ClientError::Read {
-        path: path.to_owned(),
-        source,
-    })?;
-    let options = KubeConfigOptions {
-        context: context.map(str::to_owned),
-        ..KubeConfigOptions::default()
-    };
-    let config = Config::from_custom_kubeconfig(kubeconfig, &options)
-        .await
-        .map_err(|source| ClientError::Build {
-            path: path.to_owned(),
-            source: Box::new(source),
-        })?;
-    Client::try_from(config).map_err(|source| ClientError::Build {
-        path: path.to_owned(),
-        source: Box::new(source),
-    })
 }
