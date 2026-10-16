@@ -65,8 +65,12 @@ pub(crate) fn sandbox_id_for(spec: &SandboxSpec) -> String {
 impl KubernetesProvider {
     /// Builds the provider from `config`, reading its kubeconfig file.
     pub async fn connect(config: KubernetesConfig) -> anyhow::Result<Self> {
-        let client =
-            KubeClient::from_file(config.kubeconfig.clone(), config.context.clone()).await?;
+        let client = KubeClient::from_file(config.kubeconfig.clone(), config.context.clone())
+            .await?
+            .with_refresh(
+                config.refresh_command.clone(),
+                std::time::Duration::from_secs(config.refresh_timeout_secs),
+            );
         let cluster = Cluster {
             client,
             namespace: config.namespace.clone(),
@@ -156,6 +160,7 @@ impl KubernetesProvider {
             network: spec.network.clone(),
             user: spec.user.clone(),
             node_selector: self.config.node_selector.clone(),
+            tolerations: self.config.tolerations.clone(),
             service_account: self.config.service_account.clone(),
             image_pull_secrets: self.config.image_pull_secrets.clone(),
             factory: self.config.factory.clone(),

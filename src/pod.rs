@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use k8s_openapi::api::core::v1::{
     Affinity, Container, EnvVar, Event, HostPathVolumeSource, LocalObjectReference, Node,
     NodeAffinity, NodeSelector, NodeSelectorRequirement, NodeSelectorTerm, Pod, PodSecurityContext,
-    PodSpec, ResourceRequirements, Volume, VolumeMount,
+    PodSpec, ResourceRequirements, Toleration, Volume, VolumeMount,
 };
 use k8s_openapi::api::networking::v1::{
     IPBlock, NetworkPolicy as KubeNetworkPolicy, NetworkPolicyEgressRule, NetworkPolicyPeer,
@@ -164,6 +164,19 @@ pub(crate) fn build_pod(record: &Record, incarnation: Incarnation) -> Result<Pod
             enable_service_links: Some(false),
             node_selector,
             affinity,
+            tolerations: (!record.tolerations.is_empty()).then(|| {
+                record
+                    .tolerations
+                    .iter()
+                    .map(|t| Toleration {
+                        key: t.key.clone(),
+                        operator: t.operator.clone(),
+                        value: t.value.clone(),
+                        effect: t.effect.clone(),
+                        toleration_seconds: None,
+                    })
+                    .collect()
+            }),
             image_pull_secrets: (!record.image_pull_secrets.is_empty()).then(|| {
                 record
                     .image_pull_secrets
@@ -568,6 +581,12 @@ mod tests {
             network: NetworkPolicy::default(),
             user: None,
             node_selector: BTreeMap::from([("factory".to_owned(), "true".to_owned())]),
+            tolerations: vec![crate::config::Toleration {
+                key: Some("node-role/ci".to_owned()),
+                operator: Some("Equal".to_owned()),
+                value: Some("factory".to_owned()),
+                effect: Some("NoSchedule".to_owned()),
+            }],
             service_account: Some("sa".to_owned()),
             image_pull_secrets: Vec::new(),
             factory: Some("hp".to_owned()),
@@ -597,6 +616,9 @@ mod tests {
         let spec = first.spec.expect("spec");
         assert!(spec.node_selector.is_some());
         assert!(spec.affinity.is_none());
+        let tolerations = spec.tolerations.clone().expect("tolerations");
+        assert_eq!(tolerations[0].key.as_deref(), Some("node-role/ci"));
+        assert_eq!(tolerations[0].effect.as_deref(), Some("NoSchedule"));
         assert_eq!(spec.automount_service_account_token, Some(false));
         let volume = &spec.volumes.expect("volumes")[0];
         assert_eq!(
@@ -616,6 +638,10 @@ mod tests {
         let spec = again.spec.expect("spec");
         assert!(spec.node_selector.is_none());
         assert!(spec.affinity.is_some());
+        assert!(
+            spec.tolerations.is_some(),
+            "a pinned pod still tolerates the taint"
+        );
         let volume = &spec.volumes.expect("volumes")[0];
         assert_eq!(
             volume.host_path.as_ref().and_then(|h| h.type_.as_deref()),

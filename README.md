@@ -36,7 +36,8 @@ pins). Fabro and Petri do not yet launch a plugin backend or forward workflow re
 - **Network:** `block` and CIDR allow-lists become a per-pod egress NetworkPolicy (DNS kept
   open for allow-lists). Domain allow-lists are refused.
 - **Credentials:** the cluster credential is read from a kubeconfig **file** and re-read on any
-  `401`, so a rotated ServiceAccount token is picked up without restarting the plugin. No
+  `401` (after running the optional `refresh_command`), so a rotated ServiceAccount token is
+  picked up without restarting the plugin. No
   service-account token is mounted into sandbox pods.
 
 Refused: pause/resume, archive, fork, resize, snapshots, PTY, logs, one-shot containers,
@@ -56,6 +57,17 @@ state_dir = "/home/worker/.local/state/sandbox-driver-kubernetes"
 service_account = "sandbox"
 image_pull_secrets = ["ghcr"]
 factory = "hp"                              # sets the livespec.dispatch.factory label
+# Run on a 401 before the kubeconfig is re-read, for a credential that is only
+# rewritten on demand (a pull-on-401 file). Empty by default.
+refresh_command = ["sudo", "-n", "/usr/local/bin/refresh-factory-kubeconfig"]
+refresh_timeout_secs = 60
+
+# Taints sandbox pods tolerate, in Kubernetes field names.
+[[tolerations]]
+key = "node-role/ci"
+operator = "Equal"
+value = "factory"
+effect = "NoSchedule"
 ```
 
 The namespace's ServiceAccount needs, namespace-scoped: `pods` create/get/list/watch/delete,
