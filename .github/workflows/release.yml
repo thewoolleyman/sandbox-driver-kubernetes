@@ -36,6 +36,7 @@ jobs:
           target=x86_64-unknown-linux-gnu
           mkdir dist
           install -m 0755 target/release/sandbox-driver-kubernetes "dist/sandbox-driver-kubernetes-${version}-${target}"
+          install -m 0755 target/release/sandbox-driver-kubernetes-proof "dist/sandbox-driver-kubernetes-proof-${version}-${target}"
           install -m 0755 cli/bin/lithos-sandbox "dist/lithos-sandbox-${SANDBOX_DRIVER_REV::12}-${target}"
           (cd dist && for f in *; do sha256sum "$f" > "$f.sha256"; done && cat ./*.sha256)
       - name: Publish the release
