@@ -161,6 +161,7 @@ impl KubernetesProvider {
             user: spec.user.clone(),
             node_selector: self.config.node_selector.clone(),
             tolerations: self.config.tolerations.clone(),
+            apparmor_localhost_profile: self.config.apparmor_localhost_profile.clone(),
             service_account: self.config.service_account.clone(),
             image_pull_secrets: self.config.image_pull_secrets.clone(),
             factory: self.config.factory.clone(),

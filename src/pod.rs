@@ -4,9 +4,10 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use k8s_openapi::api::core::v1::{
-    Affinity, Container, EnvVar, Event, HostPathVolumeSource, LocalObjectReference, Node,
-    NodeAffinity, NodeSelector, NodeSelectorRequirement, NodeSelectorTerm, Pod, PodSecurityContext,
-    PodSpec, ResourceRequirements, Toleration, Volume, VolumeMount,
+    Affinity, AppArmorProfile, Container, EnvVar, Event, HostPathVolumeSource,
+    LocalObjectReference, Node, NodeAffinity, NodeSelector, NodeSelectorRequirement,
+    NodeSelectorTerm, Pod, PodSecurityContext, PodSpec, ResourceRequirements, Toleration, Volume,
+    VolumeMount,
 };
 use k8s_openapi::api::networking::v1::{
     IPBlock, NetworkPolicy as KubeNetworkPolicy, NetworkPolicyEgressRule, NetworkPolicyPeer,
@@ -97,6 +98,22 @@ fn annotations(record: &Record) -> Result<BTreeMap<String, String>> {
 }
 
 /// The pod manifest for `record`.
+fn security_context(run_as_user: Option<i64>, record: &Record) -> Option<PodSecurityContext> {
+    let app_armor_profile =
+        record
+            .apparmor_localhost_profile
+            .as_ref()
+            .map(|profile| AppArmorProfile {
+                type_: "Localhost".to_owned(),
+                localhost_profile: Some(profile.clone()),
+            });
+    (run_as_user.is_some() || app_armor_profile.is_some()).then(|| PodSecurityContext {
+        run_as_user,
+        app_armor_profile,
+        ..PodSecurityContext::default()
+    })
+}
+
 pub(crate) fn build_pod(record: &Record, incarnation: Incarnation) -> Result<Pod> {
     let env = record
         .env
@@ -184,10 +201,7 @@ pub(crate) fn build_pod(record: &Record, incarnation: Incarnation) -> Result<Pod
                     .map(|name| LocalObjectReference { name: name.clone() })
                     .collect()
             }),
-            security_context: run_as_user.map(|uid| PodSecurityContext {
-                run_as_user: Some(uid),
-                ..PodSecurityContext::default()
-            }),
+            security_context: security_context(run_as_user, record),
             containers: vec![Container {
                 name: CONTAINER_NAME.to_owned(),
                 image: Some(record.image.clone()),
@@ -581,6 +595,7 @@ mod tests {
             network: NetworkPolicy::default(),
             user: None,
             node_selector: BTreeMap::from([("factory".to_owned(), "true".to_owned())]),
+            apparmor_localhost_profile: Some("ci-runner-workflow".to_owned()),
             tolerations: vec![crate::config::Toleration {
                 key: Some("node-role/ci".to_owned()),
                 operator: Some("Equal".to_owned()),
@@ -616,6 +631,16 @@ mod tests {
         let spec = first.spec.expect("spec");
         assert!(spec.node_selector.is_some());
         assert!(spec.affinity.is_none());
+        let profile = spec
+            .security_context
+            .as_ref()
+            .and_then(|context| context.app_armor_profile.clone())
+            .expect("an AppArmor profile");
+        assert_eq!(profile.type_, "Localhost");
+        assert_eq!(
+            profile.localhost_profile.as_deref(),
+            Some("ci-runner-workflow")
+        );
         let tolerations = spec.tolerations.clone().expect("tolerations");
         assert_eq!(tolerations[0].key.as_deref(), Some("node-role/ci"));
         assert_eq!(tolerations[0].effect.as_deref(), Some("NoSchedule"));

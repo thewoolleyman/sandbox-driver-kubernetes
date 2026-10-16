@@ -44,6 +44,9 @@ pub struct Record {
     /// written before the field existed still load.
     #[serde(default)]
     pub tolerations: Vec<Toleration>,
+    /// The Localhost AppArmor profile every pod of the sandbox runs under.
+    #[serde(default)]
+    pub apparmor_localhost_profile: Option<String>,
     pub service_account: Option<String>,
     pub image_pull_secrets: Vec<String>,
     pub factory: Option<String>,
@@ -158,6 +161,7 @@ mod tests {
             user: None,
             node_selector: BTreeMap::new(),
             tolerations: Vec::new(),
+            apparmor_localhost_profile: None,
             service_account: None,
             image_pull_secrets: Vec::new(),
             factory: None,
