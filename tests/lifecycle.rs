@@ -430,16 +430,35 @@ async fn a_rotated_kubeconfig_is_reread_on_401() {
         provider.client().reloads() >= 1,
         "the kubeconfig was re-read"
     );
+    // The same least-privilege Role must carry the rest of a run: exec is a
+    // WebSocket upgrade, which the API server authorizes as `get` on
+    // pods/exec, and relabelling is a merge patch on the pod.
+    let result = sandbox
+        .exec()
+        .run(&ExecSpec::new("/bin/sh").args(["-c", "printf ok"]))
+        .await
+        .expect("execs under the documented Role");
+    assert_eq!(result.stdout, b"ok");
+    sandbox
+        .set_labels(&BTreeMap::from([(
+            "rbac-check".to_owned(),
+            "relabelled".to_owned(),
+        )]))
+        .await
+        .expect("relabels under the documented Role");
     sandbox.delete().await.expect("deletes");
     let _ = std::fs::remove_file(kubeconfig);
 }
 
+/// The least-privilege Role the README documents, verb for verb: a test
+/// that passes under it is evidence the documented grant is sufficient.
 async fn install_role(client: kube::Client, name: &str) {
     let role: Role = serde_json::from_value(serde_json::json!({
         "metadata": { "name": name },
         "rules": [
             { "apiGroups": [""], "resources": ["pods"], "verbs": ["create", "get", "list", "watch", "delete", "patch"] },
             { "apiGroups": [""], "resources": ["pods/exec"], "verbs": ["create", "get"] },
+            { "apiGroups": [""], "resources": ["pods/log"], "verbs": ["get"] },
             { "apiGroups": [""], "resources": ["events"], "verbs": ["list"] },
             { "apiGroups": ["networking.k8s.io"], "resources": ["networkpolicies"], "verbs": ["create", "get", "list", "delete"] }
         ]

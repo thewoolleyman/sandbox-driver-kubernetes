@@ -70,9 +70,18 @@ value = "factory"
 effect = "NoSchedule"
 ```
 
-The namespace's ServiceAccount needs, namespace-scoped: `pods` create/get/list/watch/delete,
-`pods/exec` create, `networkpolicies` create/get/list/delete, `events` list; and cluster-scoped
-`nodes` get.
+The namespace's ServiceAccount needs, namespace-scoped:
+
+- `pods`: create, get, list, watch, delete, patch (patch relabels a live sandbox);
+- `pods/exec`: create **and get** — exec streams over a WebSocket, and the API server
+  authorizes the upgrade as `get`, so `create` alone fails with 403 on current Kubernetes;
+- `pods/log`: get;
+- `networkpolicies`: create, get, list, delete;
+- `events`: list;
+
+and, cluster-scoped, `nodes` get (the `NotReady` check). Check a subresource with
+`kubectl auth can-i get pods --subresource=exec`, not `can-i get pods/exec`, which kubectl
+reads as a pod named `exec`. The cluster tests run the plugin under exactly this Role.
 
 ## Development
 
