@@ -34,6 +34,12 @@ pub struct KubernetesProvider {
     store: RecordStore,
 }
 
+/// The backend's resource identity: the API server and the namespace,
+/// neither of them secret, both unchanged by a credential rotation.
+fn resource_identity(endpoint: &str, namespace: &str) -> String {
+    format!("{}/{namespace}", endpoint.trim_end_matches('/'))
+}
+
 /// Whether `name` is a valid DNS label (a pod name the plugin can adopt).
 fn is_dns_label(name: &str) -> bool {
     let bytes = name.as_bytes();
@@ -317,7 +323,7 @@ impl SandboxProvider for KubernetesProvider {
                 }
             })
             .await;
-        Ok(match result {
+        let mut health = match result {
             Ok(_) => ProviderHealth::new(HealthStatus::Ok),
             Err(error) => {
                 let status = match status_code(&error) {
@@ -331,13 +337,39 @@ impl SandboxProvider for KubernetesProvider {
                 ));
                 health
             }
-        })
+        };
+        // The resource namespace a host binds recovery to: which cluster, and
+        // which namespace in it. A host refuses to create or recover sandboxes
+        // on a provider that names none.
+        health.identity = Some(resource_identity(
+            &self.cluster.client.endpoint().await,
+            &self.config.namespace,
+        ));
+        Ok(health)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_resource_identity_names_the_api_server_and_the_namespace() {
+        assert_eq!(
+            resource_identity("https://192.168.1.4:6443/", "factory"),
+            "https://192.168.1.4:6443/factory"
+        );
+        assert_ne!(
+            resource_identity("https://a:6443", "factory"),
+            resource_identity("https://b:6443", "factory"),
+            "two clusters are two identities"
+        );
+        assert_ne!(
+            resource_identity("https://a:6443", "factory"),
+            resource_identity("https://a:6443", "other"),
+            "two namespaces are two identities"
+        );
+    }
 
     #[test]
     fn petri_names_become_the_pod_name_and_others_are_generated() {
