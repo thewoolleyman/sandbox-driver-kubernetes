@@ -40,6 +40,7 @@ pub struct KubeClient {
     path: PathBuf,
     context: Option<String>,
     inner: Arc<RwLock<Client>>,
+    endpoint: Arc<RwLock<String>>,
     reloads: Arc<std::sync::atomic::AtomicU64>,
     refresh: Arc<Vec<String>>,
     refresh_timeout: Duration,
@@ -48,11 +49,12 @@ pub struct KubeClient {
 impl KubeClient {
     /// Builds a client from the kubeconfig at `path`.
     pub async fn from_file(path: PathBuf, context: Option<String>) -> Result<Self, ClientError> {
-        let client = build(&path, context.as_deref()).await?;
+        let (client, endpoint) = build(&path, context.as_deref()).await?;
         Ok(Self {
             path,
             context,
             inner: Arc::new(RwLock::new(client)),
+            endpoint: Arc::new(RwLock::new(endpoint)),
             reloads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             refresh: Arc::new(Vec::new()),
             refresh_timeout: Duration::from_secs(60),
@@ -104,6 +106,13 @@ impl KubeClient {
         self.inner.read().await.clone()
     }
 
+    /// The API server URL the current client addresses: the cluster half of
+    /// the backend's resource identity. Non-secret, and unchanged by a token
+    /// rotation that keeps the same cluster.
+    pub async fn endpoint(&self) -> String {
+        self.endpoint.read().await.clone()
+    }
+
     /// How many times the kubeconfig has been re-read since start.
     pub fn reloads(&self) -> u64 {
         self.reloads.load(std::sync::atomic::Ordering::Relaxed)
@@ -111,8 +120,9 @@ impl KubeClient {
 
     /// Re-reads the kubeconfig file and replaces the client.
     pub async fn reload(&self) -> Result<(), ClientError> {
-        let client = build(&self.path, self.context.as_deref()).await?;
+        let (client, endpoint) = build(&self.path, self.context.as_deref()).await?;
         *self.inner.write().await = client;
+        *self.endpoint.write().await = endpoint;
         self.reloads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tracing::info!(path = %self.path.display(), "reloaded kubeconfig");
@@ -141,7 +151,10 @@ impl KubeClient {
     }
 }
 
-async fn build(path: &std::path::Path, context: Option<&str>) -> Result<Client, ClientError> {
+async fn build(
+    path: &std::path::Path,
+    context: Option<&str>,
+) -> Result<(Client, String), ClientError> {
     let kubeconfig = Kubeconfig::read_from(path).map_err(|source| ClientError::Read {
         path: path.to_owned(),
         source,
@@ -156,10 +169,12 @@ async fn build(path: &std::path::Path, context: Option<&str>) -> Result<Client, 
             path: path.to_owned(),
             source: Box::new(source),
         })?;
-    Client::try_from(config).map_err(|source| ClientError::Build {
+    let endpoint = config.cluster_url.to_string();
+    let client = Client::try_from(config).map_err(|source| ClientError::Build {
         path: path.to_owned(),
         source: Box::new(source),
-    })
+    })?;
+    Ok((client, endpoint))
 }
 
 #[cfg(test)]
