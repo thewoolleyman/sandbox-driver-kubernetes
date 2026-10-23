@@ -9,6 +9,17 @@
 //! belongs to the caller. Kubernetes exec takes neither a working directory
 //! nor an environment, so the wrapper changes directory itself and the
 //! environment reaches the command as `env` arguments, never through a shell.
+//!
+//! Kubernetes exec carries its command in the request URL, one `command`
+//! query parameter per argument. The command's environment, program and
+//! arguments therefore never ride in that command: a first exec streams them
+//! through stdin into a mode-0600 spec file (shell-quoted `set --` source),
+//! and the command's own exec passes only the fixed wrapper, which sources
+//! and removes that file. So the request URL stays the same size whatever
+//! the command carries, and the run's credentials are never part of a URL
+//! that an audit log or proxy could record. Without this, a 48 KB inline
+//! prepare script plus a run's 37 environment entries made a URL the
+//! cluster's exec path refused (gmktec run 01M5N2W7TNBC, run_prepare_28).
 
 use std::collections::BTreeMap;
 use std::io;
@@ -73,8 +84,10 @@ pub fn command_wrapper(
     working_dir: &str,
     stop_file: &str,
     pid_file: &str,
+    spec_file: &str,
     forward_stdin: bool,
 ) -> String {
+    let spec_file = shell_quote(spec_file);
     let working_dir = shell_quote(working_dir);
     let stop_file = shell_quote(stop_file);
     let pid_file = shell_quote(pid_file);
@@ -84,7 +97,10 @@ pub fn command_wrapper(
         ("", "< /dev/null", "")
     };
     format!(
-        "cd {working_dir} || {{ echo 'sandbox-driver: cannot enter the working directory' >&2; exit 126; }}\n\
+        "spec_file={spec_file}\n\
+         if [ ! -r \"$spec_file\" ] || ! . \"$spec_file\"; then rm -f \"$spec_file\"; echo 'sandbox-driver: cannot read the command spec' >&2; exit 126; fi\n\
+         rm -f \"$spec_file\"\n\
+         cd {working_dir} || {{ echo 'sandbox-driver: cannot enter the working directory' >&2; exit 126; }}\n\
          mkdir -p /tmp/.sandbox-driver\n\
          if ! command -v setsid >/dev/null 2>&1 || ! command -v env >/dev/null 2>&1; then\n\
            echo 'sandbox-driver: the container image must provide setsid and env' >&2\n\
@@ -124,6 +140,26 @@ pub fn command_wrapper(
          rm -f \"$stop_file\" \"$pid_file\"\n\
          exit \"$status\""
     )
+}
+
+/// The exec command for one sandbox command: the fixed wrapper alone. Its
+/// size depends only on the working directory and the control paths, never
+/// on the command's environment, program or arguments.
+fn exec_command(
+    working_dir: &str,
+    stop_file: &str,
+    pid_file: &str,
+    spec_file: &str,
+    forward_stdin: bool,
+) -> Vec<String> {
+    vec![
+        "env".to_owned(),
+        format!("{BASH_ENV_VAR}="),
+        "/bin/sh".to_owned(),
+        "-c".to_owned(),
+        command_wrapper(working_dir, stop_file, pid_file, spec_file, forward_stdin),
+        WRAPPER_NAME.to_owned(),
+    ]
 }
 
 /// The exit code a remote command reported through its status channel.
@@ -247,6 +283,29 @@ impl KubernetesExec {
         (format!("{prefix}.stop"), format!("{prefix}.pid"))
     }
 
+    /// The spec file a command's environment, program and arguments are
+    /// staged in, beside its stop and pid files.
+    fn spec_path(stop_file: &str) -> String {
+        format!("{}.spec", stop_file.trim_end_matches(".stop"))
+    }
+
+    /// Shell source that sets the wrapper's positional parameters to the
+    /// command's `env` entries, program and arguments.
+    fn command_spec(program: &str, args: &[String], env: &BTreeMap<String, String>) -> String {
+        let mut source = String::from("set --");
+        for word in Self::env_entries(env)
+            .iter()
+            .map(String::as_str)
+            .chain(std::iter::once(program))
+            .chain(args.iter().map(String::as_str))
+        {
+            source.push(' ');
+            source.push_str(&shell_quote(word));
+        }
+        source.push('\n');
+        source
+    }
+
     fn env_entries(extra: &BTreeMap<String, String>) -> Vec<String> {
         let mut entries = vec![format!("{BASH_ENV_VAR}=")];
         entries.extend(extra.iter().map(|(key, value)| format!("{key}={value}")));
@@ -257,30 +316,74 @@ impl KubernetesExec {
         &self,
         stop_file: &str,
         pid_file: &str,
-        program: &str,
-        args: &[String],
-        env: &BTreeMap<String, String>,
+        spec_file: &str,
         working_dir: Option<&str>,
         forward_stdin: bool,
     ) -> Vec<String> {
-        let wrapper = command_wrapper(
+        exec_command(
             &self.resolve_dir(working_dir),
             stop_file,
             pid_file,
+            spec_file,
             forward_stdin,
-        );
-        let mut cmd = vec![
+        )
+    }
+
+    /// Writes a command's spec file through the exec stdin stream, so its
+    /// content never reaches the request URL.
+    async fn stage_spec(&self, spec_file: &str, source: String) -> Result<()> {
+        let cmd = vec![
             "env".to_owned(),
             format!("{BASH_ENV_VAR}="),
             "/bin/sh".to_owned(),
             "-c".to_owned(),
-            wrapper,
-            WRAPPER_NAME.to_owned(),
+            "umask 077 && mkdir -p /tmp/.sandbox-driver && cat > \"$1\"".to_owned(),
+            "sandbox-driver-spec".to_owned(),
+            spec_file.to_owned(),
         ];
-        cmd.extend(Self::env_entries(env));
-        cmd.push(program.to_owned());
-        cmd.extend(args.iter().cloned());
-        cmd
+        let mut process = self.attach(cmd, true).await?;
+        let status = process.take_status();
+        let mut input = process.stdin().ok_or_else(|| {
+            Error::io(
+                "staging the command spec",
+                io::Error::other("no stdin channel"),
+            )
+        })?;
+        input
+            .write_all(source.as_bytes())
+            .await
+            .map_err(|error| Error::io("staging the command spec", error))?;
+        input
+            .shutdown()
+            .await
+            .map_err(|error| Error::io("staging the command spec", error))?;
+        drop(input);
+        let mut stderr = Vec::new();
+        let mut output = merged_output(&mut process);
+        while let Some(chunk) = output.next().await {
+            match chunk {
+                Ok(Chunk::Stderr(bytes)) => stderr.extend_from_slice(&bytes),
+                Ok(Chunk::Stdout(_)) => {}
+                Err(error) => return Err(Error::io("staging the command spec", error)),
+            }
+        }
+        let status = match status {
+            Some(status) => tokio::time::timeout(STATUS_WAIT, status)
+                .await
+                .ok()
+                .flatten(),
+            None => None,
+        };
+        match status.as_ref().and_then(exit_code_of) {
+            Some(0) => Ok(()),
+            code => Err(Error::io(
+                "staging the command spec",
+                io::Error::other(format!(
+                    "the spec write exited {code:?}: {}",
+                    String::from_utf8_lossy(&stderr).trim()
+                )),
+            )),
+        }
     }
 
     /// Starts `cmd` in the sandbox container. A failure to reach the pod is
@@ -381,12 +484,16 @@ impl KubernetesExec {
         let started = Instant::now();
         let (stop_file, pid_file) = self.control_paths();
         let stdin_reader = controls.stdin_reader(spec);
+        let spec_file = Self::spec_path(&stop_file);
+        self.stage_spec(
+            &spec_file,
+            Self::command_spec(&spec.program, &spec.args, &spec.launch_env()),
+        )
+        .await?;
         let cmd = self.wrapped_cmd(
             &stop_file,
             &pid_file,
-            &spec.program,
-            &spec.args,
-            &spec.launch_env(),
+            &spec_file,
             spec.working_dir.as_deref(),
             stdin_reader.is_some(),
         );
@@ -449,12 +556,16 @@ impl KubernetesExec {
 
     async fn spawn_stdio_raw(&self, spec: &SpawnSpec) -> Result<StdioProcess> {
         let (stop_file, pid_file) = self.control_paths();
+        let spec_file = Self::spec_path(&stop_file);
+        self.stage_spec(
+            &spec_file,
+            Self::command_spec(&spec.program, &spec.args, &spec.launch_env()),
+        )
+        .await?;
         let cmd = self.wrapped_cmd(
             &stop_file,
             &pid_file,
-            &spec.program,
-            &spec.args,
-            &spec.launch_env(),
+            &spec_file,
             spec.working_dir.as_deref(),
             true,
         );
@@ -710,5 +821,187 @@ mod tests {
     #[test]
     fn quoting_survives_single_quotes() {
         assert_eq!(shell_quote("it's"), "'it'\\''s'");
+    }
+
+    /// The request URL `kube` builds for an exec: one `command` query
+    /// parameter per argument, percent-encoded.
+    fn exec_query(cmd: &[String]) -> String {
+        cmd.iter()
+            .map(|word| {
+                let encoded: String = word
+                    .bytes()
+                    .map(|byte| match byte {
+                        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                            (byte as char).to_string()
+                        }
+                        _ => format!("%{byte:02X}"),
+                    })
+                    .collect();
+                format!("command={encoded}")
+            })
+            .collect::<Vec<_>>()
+            .join("&")
+    }
+
+    fn large_command() -> (String, Vec<String>, BTreeMap<String, String>) {
+        let env = (0..40)
+            .map(|index| (format!("SECRET_{index:02}"), "s".repeat(1000)))
+            .collect();
+        (
+            "/bin/sh".to_owned(),
+            vec!["-c".to_owned(), "x".repeat(200_000)],
+            env,
+        )
+    }
+
+    fn control_paths() -> (&'static str, &'static str, &'static str) {
+        (
+            "/tmp/.sandbox-driver/exec-1-2-3.stop",
+            "/tmp/.sandbox-driver/exec-1-2-3.pid",
+            "/tmp/.sandbox-driver/exec-1-2-3.spec",
+        )
+    }
+
+    #[test]
+    fn the_exec_url_does_not_carry_the_command() {
+        let (program, args, env) = large_command();
+        let (stop, pid, spec_file) = control_paths();
+        let cmd = exec_command("/workspace", stop, pid, spec_file, true);
+        let query = exec_query(&cmd);
+        assert!(query.len() < 8192, "exec query is {} bytes", query.len());
+        assert!(
+            !query.contains("SECRET_"),
+            "the environment reached the exec URL"
+        );
+        let spec = KubernetesExec::command_spec(&program, &args, &env);
+        assert!(spec.contains(&args[1]) && spec.contains("SECRET_39="));
+    }
+
+    #[test]
+    fn the_spec_file_sits_beside_the_control_files() {
+        let (stop, _, spec_file) = control_paths();
+        assert_eq!(KubernetesExec::spec_path(stop), spec_file);
+    }
+
+    /// Runs the wrapper under the local `/bin/sh`, as the pod's shell runs it.
+    fn run_wrapper(
+        dir: &std::path::Path,
+        program: &str,
+        args: &[String],
+        env: &BTreeMap<String, String>,
+        stdin: Option<&[u8]>,
+    ) -> std::process::Output {
+        use std::io::Write as _;
+        let path = |name: &str| dir.join(name).to_string_lossy().into_owned();
+        std::fs::write(
+            path("cmd.spec"),
+            KubernetesExec::command_spec(program, args, env),
+        )
+        .expect("test io");
+        let cmd = exec_command(
+            &dir.to_string_lossy(),
+            &path("cmd.stop"),
+            &path("cmd.pid"),
+            &path("cmd.spec"),
+            stdin.is_some(),
+        );
+        let mut child = std::process::Command::new(&cmd[0])
+            .args(&cmd[1..])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("test io");
+        // Feed stdin from its own thread: the command's output fills its pipe
+        // long before a large input is written, so writing and then reading
+        // on one thread deadlocks.
+        let mut input = child.stdin.take().expect("test io");
+        let bytes = stdin.unwrap_or_default().to_vec();
+        let writer = std::thread::spawn(move || input.write_all(&bytes));
+        let pid = child.id();
+        let (done, waited) = std::sync::mpsc::channel();
+        std::thread::spawn(move || done.send(child.wait_with_output().expect("test io")));
+        let output = waited
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap_or_else(|_| {
+                let _ = std::process::Command::new("kill")
+                    .arg("-9")
+                    .arg(pid.to_string())
+                    .status();
+                panic!("the wrapper did not finish within 30s")
+            });
+        writer.join().expect("test io").expect("test io");
+        output
+    }
+
+    fn scratch_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "sandbox-driver-kubernetes-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("test io");
+        dir
+    }
+
+    #[test]
+    fn the_wrapper_runs_the_staged_command_with_its_environment_and_removes_the_spec() {
+        let dir = scratch_dir("staged");
+        let env = BTreeMap::from([
+            ("QUOTED".to_owned(), "it's\nmulti line $HOME `x`".to_owned()),
+            ("EMPTY".to_owned(), String::new()),
+        ]);
+        let args = vec![
+            "-c".to_owned(),
+            "printf '[%s][%s][%s][%s]' \"$QUOTED\" \"$EMPTY\" \"$1\" \"$#\"".to_owned(),
+            "prog".to_owned(),
+            "a 'b' \"c\"".to_owned(),
+        ];
+        let output = run_wrapper(&dir, "/bin/sh", &args, &env, None);
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "[it's\nmulti line $HOME `x`][][a 'b' \"c\"][1]",
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.status.code(), Some(0));
+        assert!(
+            !dir.join("cmd.spec").exists(),
+            "the spec file was left behind"
+        );
+        std::fs::remove_dir_all(&dir).expect("test io");
+    }
+
+    #[test]
+    fn a_forwarded_stdin_still_reaches_the_command_unchanged() {
+        let dir = scratch_dir("stdin");
+        let input: Vec<u8> = (0..=255_u8).cycle().take(300_000).collect();
+        let output = run_wrapper(&dir, "cat", &[], &BTreeMap::new(), Some(&input));
+        assert_eq!(output.status.code(), Some(0));
+        assert!(
+            output.stdout == input,
+            "stdin did not reach the command unchanged"
+        );
+        std::fs::remove_dir_all(&dir).expect("test io");
+    }
+
+    #[test]
+    fn a_missing_spec_fails_the_command_rather_than_running_nothing() {
+        let dir = scratch_dir("missing");
+        let path = |name: &str| dir.join(name).to_string_lossy().into_owned();
+        let cmd = exec_command(
+            &dir.to_string_lossy(),
+            &path("cmd.stop"),
+            &path("cmd.pid"),
+            &path("absent.spec"),
+            false,
+        );
+        let output = std::process::Command::new(&cmd[0])
+            .args(&cmd[1..])
+            .output()
+            .expect("test io");
+        assert_eq!(output.status.code(), Some(126));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("cannot read the command spec"));
+        std::fs::remove_dir_all(&dir).expect("test io");
     }
 }
