@@ -330,8 +330,32 @@ impl KubernetesExec {
     }
 
     /// Writes a command's spec file through the exec stdin stream, so its
-    /// content never reaches the request URL.
+    /// content never reaches the request URL. A write the shell refused is
+    /// reported with its exit code; a write that lost the sandbox part way
+    /// is diagnosed like any other exec, so a `NotReady` node stays
+    /// retryable.
     async fn stage_spec(&self, spec_file: &str, source: String) -> Result<()> {
+        match self.write_spec(spec_file, source).await {
+            Ok((Some(0), _)) => Ok(()),
+            Ok((Some(code), stderr)) => Err(Error::io(
+                "staging the command spec",
+                io::Error::other(format!(
+                    "the spec write exited {code}: {}",
+                    String::from_utf8_lossy(&stderr).trim()
+                )),
+            )),
+            Ok((None, _)) => Err(self
+                .diagnose(Error::Transport(TransportError::new(
+                    "the spec write ended without an exit status; the sandbox became unreachable",
+                )))
+                .await),
+            Err(error) => Err(self.diagnose(error).await),
+        }
+    }
+
+    /// Streams `source` into the spec file and returns the write's exit
+    /// code, if the sandbox reported one, with its stderr.
+    async fn write_spec(&self, spec_file: &str, source: String) -> Result<(Option<i32>, Vec<u8>)> {
         let cmd = vec![
             "env".to_owned(),
             format!("{BASH_ENV_VAR}="),
@@ -374,16 +398,7 @@ impl KubernetesExec {
                 .flatten(),
             None => None,
         };
-        match status.as_ref().and_then(exit_code_of) {
-            Some(0) => Ok(()),
-            code => Err(Error::io(
-                "staging the command spec",
-                io::Error::other(format!(
-                    "the spec write exited {code:?}: {}",
-                    String::from_utf8_lossy(&stderr).trim()
-                )),
-            )),
-        }
+        Ok((status.as_ref().and_then(exit_code_of), stderr))
     }
 
     /// Starts `cmd` in the sandbox container. A failure to reach the pod is
