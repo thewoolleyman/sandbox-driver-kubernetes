@@ -51,8 +51,11 @@ pub(crate) fn kube_error(context: &str, error: kube::Error) -> Error {
             context.to_owned(),
             error,
         )),
+        // The source's own text is part of the message: a caller that logs
+        // only the message (the worker does) otherwise cannot tell a refused
+        // upgrade from a dropped connection.
         None => Error::Transport(TransportError::with_source(
-            format!("{context}: reaching the Kubernetes API failed"),
+            format!("{context}: reaching the Kubernetes API failed: {error}"),
             error,
         )),
     }
