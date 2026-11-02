@@ -56,6 +56,28 @@ pub struct Record {
     pub factory: Option<String>,
 }
 
+/// The environment key under which [`Record::ambient_environment`] reports
+/// the cluster node the sandbox's pod runs on. Petri carries a provider's
+/// `sandbox/environment` map to its caller unchanged, so this is how the
+/// caller (Fabro's `run_turn` telemetry) learns the node without a protocol
+/// change.
+pub const NODE_NAME_ENV: &str = "K8S_NODE_NAME";
+
+impl Record {
+    /// The sandbox's ambient environment: the caller's `env`, plus
+    /// [`NODE_NAME_ENV`] naming the node once the pod has been scheduled.
+    /// A caller-supplied value under that key is left as the caller gave it.
+    pub fn ambient_environment(&self) -> BTreeMap<String, String> {
+        let mut environment = self.env.clone();
+        if let Some(node) = &self.node {
+            environment
+                .entry(NODE_NAME_ENV.to_owned())
+                .or_insert_with(|| node.clone());
+        }
+        environment
+    }
+}
+
 /// The directory of records.
 #[derive(Clone, Debug)]
 pub struct RecordStore {
@@ -171,6 +193,39 @@ mod tests {
             image_pull_secrets: Vec::new(),
             factory: None,
         }
+    }
+
+    #[test]
+    fn the_ambient_environment_names_the_scheduled_node() {
+        let environment = record("sbx").ambient_environment();
+        assert_eq!(
+            environment.get(NODE_NAME_ENV).map(String::as_str),
+            Some("node-a")
+        );
+        assert_eq!(environment.get("K").map(String::as_str), Some("secret"));
+        assert_eq!(environment.len(), 2);
+    }
+
+    #[test]
+    fn an_unscheduled_sandbox_reports_no_node() {
+        let mut unscheduled = record("sbx");
+        unscheduled.node = None;
+        let environment = unscheduled.ambient_environment();
+        assert!(!environment.contains_key(NODE_NAME_ENV));
+        assert_eq!(environment, unscheduled.env);
+    }
+
+    #[test]
+    fn a_caller_supplied_node_name_is_not_overwritten() {
+        let mut supplied = record("sbx");
+        supplied
+            .env
+            .insert(NODE_NAME_ENV.to_owned(), "caller-value".to_owned());
+        let environment = supplied.ambient_environment();
+        assert_eq!(
+            environment.get(NODE_NAME_ENV).map(String::as_str),
+            Some("caller-value")
+        );
     }
 
     #[test]
