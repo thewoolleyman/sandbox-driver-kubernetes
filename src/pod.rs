@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 use k8s_openapi::api::core::v1::{
     Affinity, AppArmorProfile, Container, EnvVar, Event, HostPathVolumeSource,
     LocalObjectReference, Node, NodeAffinity, NodeSelector, NodeSelectorRequirement,
-    NodeSelectorTerm, Pod, PodSecurityContext, PodSpec, ResourceRequirements, Toleration, Volume,
-    VolumeMount,
+    NodeSelectorTerm, Pod, PodSecurityContext, PodSpec, ResourceRequirements, Toleration,
+    TopologySpreadConstraint, Volume, VolumeMount,
 };
 use k8s_openapi::api::networking::v1::{
     IPBlock, NetworkPolicy as KubeNetworkPolicy, NetworkPolicyEgressRule, NetworkPolicyPeer,
@@ -114,6 +114,31 @@ fn security_context(run_as_user: Option<i64>, record: &Record) -> Option<PodSecu
     })
 }
 
+/// The first pod's topology spread constraints. Each counts every pod this
+/// plugin manages in the namespace, so sandboxes spread across nodes rather
+/// than stacking on the one the scheduler's resource scoring happens to favour.
+fn topology_spread_constraints(record: &Record) -> Option<Vec<TopologySpreadConstraint>> {
+    (!record.topology_spread.is_empty()).then(|| {
+        record
+            .topology_spread
+            .iter()
+            .map(|spread| TopologySpreadConstraint {
+                topology_key: spread.topology_key.clone(),
+                max_skew: spread.max_skew,
+                when_unsatisfiable: spread.when_unsatisfiable.clone(),
+                label_selector: Some(LabelSelector {
+                    match_labels: Some(BTreeMap::from([(
+                        MANAGED_LABEL.to_owned(),
+                        MANAGED_VALUE.to_owned(),
+                    )])),
+                    ..LabelSelector::default()
+                }),
+                ..TopologySpreadConstraint::default()
+            })
+            .collect()
+    })
+}
+
 pub(crate) fn build_pod(record: &Record, incarnation: Incarnation) -> Result<Pod> {
     let env = record
         .env
@@ -128,7 +153,8 @@ pub(crate) fn build_pod(record: &Record, incarnation: Incarnation) -> Result<Pod
         Incarnation::First => "DirectoryOrCreate",
         Incarnation::Recreate => "Directory",
     };
-    let (node_selector, affinity) = match &record.node {
+    // A pod pinned to its sandbox's node has nowhere to spread to.
+    let (node_selector, affinity, topology_spread) = match &record.node {
         Some(node) => (
             None,
             Some(Affinity {
@@ -147,10 +173,12 @@ pub(crate) fn build_pod(record: &Record, incarnation: Incarnation) -> Result<Pod
                 }),
                 ..Affinity::default()
             }),
+            None,
         ),
         None => (
             (!record.node_selector.is_empty()).then(|| record.node_selector.clone()),
             None,
+            topology_spread_constraints(record),
         ),
     };
     let run_as_user = record
@@ -181,6 +209,7 @@ pub(crate) fn build_pod(record: &Record, incarnation: Incarnation) -> Result<Pod
             enable_service_links: Some(false),
             node_selector,
             affinity,
+            topology_spread_constraints: topology_spread,
             tolerations: (!record.tolerations.is_empty()).then(|| {
                 record
                     .tolerations
@@ -602,6 +631,11 @@ mod tests {
                 value: Some("factory".to_owned()),
                 effect: Some("NoSchedule".to_owned()),
             }],
+            topology_spread: vec![crate::config::TopologySpread {
+                topology_key: "kubernetes.io/hostname".to_owned(),
+                max_skew: 1,
+                when_unsatisfiable: "ScheduleAnyway".to_owned(),
+            }],
             service_account: Some("sa".to_owned()),
             image_pull_secrets: Vec::new(),
             factory: Some("hp".to_owned()),
@@ -644,6 +678,25 @@ mod tests {
         let tolerations = spec.tolerations.clone().expect("tolerations");
         assert_eq!(tolerations[0].key.as_deref(), Some("node-role/ci"));
         assert_eq!(tolerations[0].effect.as_deref(), Some("NoSchedule"));
+        let spread = spec
+            .topology_spread_constraints
+            .clone()
+            .expect("a first pod spreads");
+        assert_eq!(spread.len(), 1);
+        assert_eq!(spread[0].topology_key, "kubernetes.io/hostname");
+        assert_eq!(spread[0].max_skew, 1);
+        assert_eq!(spread[0].when_unsatisfiable, "ScheduleAnyway");
+        let selected = spread[0]
+            .label_selector
+            .as_ref()
+            .and_then(|selector| selector.match_labels.clone())
+            .expect("the spread counts managed pods");
+        assert_eq!(selected[MANAGED_LABEL], MANAGED_VALUE);
+        assert_eq!(
+            first.metadata.labels.as_ref().expect("labels")[MANAGED_LABEL],
+            MANAGED_VALUE,
+            "the pod carries the label its own spread counts"
+        );
         assert_eq!(spec.automount_service_account_token, Some(false));
         let volume = &spec.volumes.expect("volumes")[0];
         assert_eq!(
@@ -663,6 +716,10 @@ mod tests {
         let spec = again.spec.expect("spec");
         assert!(spec.node_selector.is_none());
         assert!(spec.affinity.is_some());
+        assert!(
+            spec.topology_spread_constraints.is_none(),
+            "a pinned pod has nowhere to spread"
+        );
         assert!(
             spec.tolerations.is_some(),
             "a pinned pod still tolerates the taint"

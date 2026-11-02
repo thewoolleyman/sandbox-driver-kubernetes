@@ -27,6 +27,10 @@ pub struct KubernetesConfig {
     pub node_selector: BTreeMap<String, String>,
     /// Taints sandbox pods tolerate, so a tainted factory node can take them.
     pub tolerations: Vec<Toleration>,
+    /// Topology spread constraints for a sandbox's first pod, over every pod
+    /// this plugin manages in the namespace. Empty leaves placement to the
+    /// scheduler's default scoring, which can stack every sandbox on one node.
+    pub topology_spread: Vec<TopologySpread>,
     /// A node-loaded AppArmor profile the sandbox pods run under
     /// (`Localhost`), instead of the runtime default. On hosts whose kernel
     /// stacks an exec'd process as `<profile>//&unconfined`, the runtime
@@ -56,6 +60,31 @@ pub struct KubernetesConfig {
     pub refresh_timeout_secs: u64,
 }
 
+/// One topology spread constraint, in the Kubernetes field names. Its label
+/// selector is always this plugin's managed-pod label, so the spread counts
+/// sandbox pods and nothing else.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TopologySpread {
+    /// The node label whose values are the topology domains, for example
+    /// `kubernetes.io/hostname`.
+    pub topology_key: String,
+    /// The largest allowed difference in matching pods between two domains.
+    #[serde(default = "default_max_skew")]
+    pub max_skew: i32,
+    /// `ScheduleAnyway` (a scoring preference) or `DoNotSchedule` (a filter).
+    #[serde(default = "default_when_unsatisfiable")]
+    pub when_unsatisfiable: String,
+}
+
+fn default_max_skew() -> i32 {
+    1
+}
+
+fn default_when_unsatisfiable() -> String {
+    "ScheduleAnyway".to_owned()
+}
+
 /// One pod toleration, in the Kubernetes field names.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
@@ -80,6 +109,7 @@ impl Default for KubernetesConfig {
                 "true".to_owned(),
             )]),
             tolerations: Vec::new(),
+            topology_spread: Vec::new(),
             apparmor_localhost_profile: None,
             workspace_root: "/var/lib/sandbox-driver-kubernetes/workspaces".to_owned(),
             state_dir: home
@@ -215,6 +245,24 @@ mod tests {
         assert_eq!(parsed.tolerations[0].key.as_deref(), Some("node-role/ci"));
         assert_eq!(parsed.tolerations[0].effect.as_deref(), Some("NoSchedule"));
         assert!(toml::from_str::<KubernetesConfig>("[[tolerations]]\nbogus = 1\n").is_err());
+        let spread: KubernetesConfig =
+            toml::from_str("[[topology_spread]]\ntopology_key = \"kubernetes.io/hostname\"\n")
+                .expect("parses");
+        assert_eq!(
+            spread.topology_spread,
+            vec![TopologySpread {
+                topology_key: "kubernetes.io/hostname".to_owned(),
+                max_skew: 1,
+                when_unsatisfiable: "ScheduleAnyway".to_owned(),
+            }]
+        );
+        assert!(toml::from_str::<KubernetesConfig>("[[topology_spread]]\nmax_skew = 2\n").is_err());
+        assert!(
+            toml::from_str::<KubernetesConfig>(
+                "[[topology_spread]]\ntopology_key = \"k\"\nbogus = 1\n"
+            )
+            .is_err()
+        );
         let profiled: KubernetesConfig =
             toml::from_str("apparmor_localhost_profile = \"ci-runner-workflow\"\n")
                 .expect("parses");
