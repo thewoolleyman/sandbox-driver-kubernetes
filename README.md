@@ -34,6 +34,11 @@ pins). Fabro and Petri do not yet launch a plugin backend or forward workflow re
   `K8S_NODE_NAME` is left as given.
 - **Node loss:** a sandbox whose node is `NotReady` is reported unavailable, not lost; commands
   fail with a retryable error and no replacement pod is created.
+- **API outage:** a request whose connection the Kubernetes API refuses (a k3s server restart,
+  a flannel panic) is retried with exponential backoff for up to two minutes. Only CONNECT-phase
+  failures are retried, so nothing reached the server and a command is never started twice; a
+  failure after connecting is returned as before. A refusal outlasting the budget is a retryable
+  error (`code: api-unreachable`) naming the operation, the attempts and the elapsed time.
 - **Labels:** values Kubernetes cannot carry (Petri's `petri.workspace` contains `/`) are encoded
   injectively and reversibly (`x_` prefix, `_hh` escapes); an encoding over 63 characters is
   refused, never truncated. Verbatim values are kept in annotations.

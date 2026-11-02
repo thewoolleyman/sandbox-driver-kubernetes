@@ -1240,11 +1240,12 @@ dependencies = [
 
 [[package]]
 name = "sandbox-driver-kubernetes"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "async-trait",
  "futures-util",
+ "hyper-util",
  "k8s-openapi",
  "kube",
  "rand 0.9.5",
