@@ -73,6 +73,14 @@ key = "node-role/ci"
 operator = "Equal"
 value = "factory"
 effect = "NoSchedule"
+
+# Spread sandboxes across nodes. Applied to a sandbox's first pod only (a re-created
+# pod is pinned to its workspace's node), and counted over every pod this plugin
+# manages. max_skew defaults to 1 and when_unsatisfiable to ScheduleAnyway, a scoring
+# preference that never leaves a pod pending. Empty (the default) leaves placement to
+# the scheduler's resource scoring, which can stack every sandbox on one node.
+[[topology_spread]]
+topology_key = "kubernetes.io/hostname"
 ```
 
 The namespace's ServiceAccount needs, namespace-scoped:

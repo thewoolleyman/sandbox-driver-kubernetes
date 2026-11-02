@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use sandbox_driver::{NetworkPolicy, Resources};
 use serde::{Deserialize, Serialize};
 
-use crate::config::Toleration;
+use crate::config::{Toleration, TopologySpread};
 
 /// Everything needed to rebuild a sandbox's pod and network policy.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -44,6 +44,10 @@ pub struct Record {
     /// written before the field existed still load.
     #[serde(default)]
     pub tolerations: Vec<Toleration>,
+    /// Topology spread constraints for the first pod. Defaulted so records
+    /// written before the field existed still load.
+    #[serde(default)]
+    pub topology_spread: Vec<TopologySpread>,
     /// The Localhost AppArmor profile every pod of the sandbox runs under.
     #[serde(default)]
     pub apparmor_localhost_profile: Option<String>,
@@ -161,6 +165,7 @@ mod tests {
             user: None,
             node_selector: BTreeMap::new(),
             tolerations: Vec::new(),
+            topology_spread: Vec::new(),
             apparmor_localhost_profile: None,
             service_account: None,
             image_pull_secrets: Vec::new(),
