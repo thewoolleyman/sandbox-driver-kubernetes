@@ -1,6 +1,6 @@
 [package]
 name = "sandbox-driver-kubernetes"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -20,6 +20,7 @@ path = "src/bin/proof.rs"
 anyhow = "1"
 async-trait = "0.1"
 futures-util = "0.3"
+hyper-util = { version = "0.1.21", default-features = false, features = ["client-legacy"] }
 k8s-openapi = { version = "0.28", features = ["v1_33"] }
 kube = { version = "4.2", default-features = false, features = ["client", "config", "rustls-tls", "ring", "ws"] }
 rand = "0.9"

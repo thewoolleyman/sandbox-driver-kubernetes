@@ -51,6 +51,22 @@ pub(crate) fn kube_error(context: &str, error: kube::Error) -> Error {
             context.to_owned(),
             error,
         )),
+        // A connection the API never accepted, retried until the budget ran
+        // out: the cluster is unreachable rather than the sandbox broken, so
+        // the caller may retry later.
+        None if exhausted_retry(&error).is_some() => {
+            let (attempts, elapsed) = exhausted_retry(&error).unwrap_or_default();
+            let mut provider = ProviderError::with_source(
+                kubernetes_kind(),
+                format!(
+                    "{context}: the Kubernetes API refused the connection on all {attempts} attempts over {elapsed:.1}s: {error}"
+                ),
+                error,
+            );
+            provider.retryable = true;
+            provider.code = Some("api-unreachable".to_owned());
+            Error::Provider(provider)
+        }
         // The source's own text is part of the message: a caller that logs
         // only the message (the worker does) otherwise cannot tell a refused
         // upgrade from a dropped connection.
@@ -59,6 +75,16 @@ pub(crate) fn kube_error(context: &str, error: kube::Error) -> Error {
             error,
         )),
     }
+}
+
+/// The attempts and elapsed seconds of a connect retry that ran out.
+fn exhausted_retry(error: &kube::Error) -> Option<(u32, f64)> {
+    let kube::Error::Service(service) = error else {
+        return None;
+    };
+    service
+        .downcast_ref::<crate::client::ConnectRetryExhausted>()
+        .map(|exhausted| (exhausted.attempts, exhausted.elapsed_secs))
 }
 
 pub(crate) fn not_found(id: &str) -> Error {
