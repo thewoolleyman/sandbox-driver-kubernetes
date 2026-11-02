@@ -28,6 +28,10 @@ pins). Fabro and Petri do not yet launch a plugin backend or forward workflow re
 - **Lifecycle fence:** `stop` deletes the pod and waits until it is gone from the API; `start`
   re-creates it from the record and refuses while a pod of that name still exists; `delete`
   empties the workspace and removes pod, network policy and record.
+- **Node name:** once the pod is scheduled, `sandbox/environment` reports the node it runs on as
+  `K8S_NODE_NAME`, so a caller that only sees the provider's environment map (Petri passes it
+  through unchanged) can name the node, for example on its telemetry. A caller-supplied
+  `K8S_NODE_NAME` is left as given.
 - **Node loss:** a sandbox whose node is `NotReady` is reported unavailable, not lost; commands
   fail with a retryable error and no replacement pod is created.
 - **Labels:** values Kubernetes cannot carry (Petri's `petri.workspace` contains `/`) are encoded

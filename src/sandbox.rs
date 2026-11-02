@@ -266,7 +266,7 @@ impl Sandbox for KubernetesSandbox {
     }
 
     async fn environment(&self) -> Result<BTreeMap<String, String>> {
-        Ok(self.record.lock().await.env.clone())
+        Ok(self.record.lock().await.ambient_environment())
     }
 
     async fn platform_info(&self) -> Result<PlatformInfo> {
