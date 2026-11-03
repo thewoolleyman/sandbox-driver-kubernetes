@@ -46,6 +46,7 @@ mod error;
 mod exec;
 mod fs;
 mod labels;
+mod owner;
 mod pod;
 mod provider;
 mod record;

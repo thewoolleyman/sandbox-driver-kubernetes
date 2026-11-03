@@ -17,7 +17,10 @@ use sandbox_driver::{
 use crate::client::KubeClient;
 use crate::config::KubernetesConfig;
 use crate::error::{not_found, record_io, status_code};
-use crate::pod::{Cluster, Incarnation, build_network_policy, resource_requirements};
+use crate::pod::{
+    CLEANUP_OF_LABEL, CLEANUP_OWNER_ANNOTATION, Cluster, Incarnation, build_network_policy,
+    resource_requirements,
+};
 use crate::record::{Record, RecordStore};
 use crate::sandbox::{KubernetesSandbox, Timeouts, status_of};
 use crate::{
@@ -96,10 +99,38 @@ impl KubernetesProvider {
         &self.cluster.client
     }
 
+    /// Removes every cleanup pod whose owning plugin process has ended: the
+    /// delete that created it was interrupted and can no longer remove it. A
+    /// cleanup pod a live delete is still waiting on is left alone, and so is
+    /// one owned by another host's process (or another provider instance's,
+    /// whose records this store does not hold), which this host cannot judge.
+    async fn remove_abandoned_cleanup_pods(&self) -> Result<()> {
+        for pod in self.cluster.list_pods(CLEANUP_OF_LABEL).await? {
+            let Some(name) = pod.metadata.name.as_deref() else {
+                continue;
+            };
+            let abandoned = pod
+                .metadata
+                .annotations
+                .as_ref()
+                .and_then(|annotations| annotations.get(CLEANUP_OWNER_ANNOTATION))
+                .is_some_and(|owner| crate::owner::is_abandoned(owner));
+            if abandoned {
+                tracing::info!(
+                    pod = name,
+                    "removing a workspace cleanup pod an interrupted delete left"
+                );
+                self.cluster.delete_pod(name).await?;
+            }
+        }
+        Ok(())
+    }
+
     fn timeouts(&self) -> Timeouts {
         Timeouts {
             start: Duration::from_secs(self.config.start_timeout_secs),
             stop: Duration::from_secs(self.config.stop_timeout_secs),
+            cleanup: Duration::from_secs(self.config.cleanup_timeout_secs),
         }
     }
 
@@ -290,6 +321,7 @@ impl SandboxProvider for KubernetesProvider {
             .into_iter()
             .filter_map(|pod| pod.metadata.name.clone().map(|name| (name, pod)))
             .collect();
+        self.remove_abandoned_cleanup_pods().await?;
         let mut statuses = Vec::new();
         for record in records {
             if record.namespace != self.config.namespace {

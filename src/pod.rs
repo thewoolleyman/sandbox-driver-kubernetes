@@ -27,9 +27,25 @@ use crate::{CONTAINER_NAME, LABELS_ANNOTATION, MANAGED_LABEL, MANAGED_VALUE};
 
 /// Label naming the logical sandbox a pod or policy belongs to.
 pub(crate) const SANDBOX_LABEL: &str = "sandbox-driver-kubernetes/sandbox";
+/// Label naming the sandbox whose workspace a cleanup pod empties. A cleanup
+/// pod carries no [`SANDBOX_LABEL`], so nothing mistakes it for the sandbox.
+pub(crate) const CLEANUP_OF_LABEL: &str = "sandbox-driver-kubernetes/cleanup-of";
+/// Annotation naming the plugin process that created a cleanup pod, as
+/// `<host>/<pid>/<start-ticks>`, so another process can tell an abandoned
+/// cleanup from one still in progress.
+pub(crate) const CLEANUP_OWNER_ANNOTATION: &str = "sandbox-driver-kubernetes/cleanup-owner";
+/// CPU a cleanup pod requests and is limited to.
+pub(crate) const CLEANUP_CPU: &str = "100m";
+/// Memory a cleanup pod requests and is limited to.
+pub(crate) const CLEANUP_MEMORY: &str = "128Mi";
 /// Label carrying the factory identity, when configured.
 pub(crate) const FACTORY_LABEL: &str = "livespec.dispatch.factory";
 const HOSTNAME_LABEL: &str = "kubernetes.io/hostname";
+/// What [`Cluster::wait_ended`] reports for a pod whose workspace directory
+/// is gone from its node, so it can never start.
+pub(crate) const NO_WORKSPACE: &str = "NoWorkspace";
+/// The container name of a cleanup pod.
+const CLEANUP_CONTAINER_NAME: &str = "cleanup";
 const POLL: Duration = Duration::from_secs(1);
 
 /// Whether the pod is the first of its sandbox (its workspace directory may
@@ -139,6 +155,136 @@ fn topology_spread_constraints(record: &Record) -> Option<Vec<TopologySpreadCons
     })
 }
 
+/// Required node affinity to exactly `node`.
+fn pinned_to(node: &str) -> Affinity {
+    Affinity {
+        node_affinity: Some(NodeAffinity {
+            required_during_scheduling_ignored_during_execution: Some(NodeSelector {
+                node_selector_terms: vec![NodeSelectorTerm {
+                    match_expressions: Some(vec![NodeSelectorRequirement {
+                        key: HOSTNAME_LABEL.to_owned(),
+                        operator: "In".to_owned(),
+                        values: Some(vec![node.to_owned()]),
+                    }]),
+                    match_fields: None,
+                }],
+            }),
+            ..NodeAffinity::default()
+        }),
+        ..Affinity::default()
+    }
+}
+
+fn tolerations(record: &Record) -> Option<Vec<Toleration>> {
+    (!record.tolerations.is_empty()).then(|| {
+        record
+            .tolerations
+            .iter()
+            .map(|t| Toleration {
+                key: t.key.clone(),
+                operator: t.operator.clone(),
+                value: t.value.clone(),
+                effect: t.effect.clone(),
+                toleration_seconds: None,
+            })
+            .collect()
+    })
+}
+
+fn image_pull_secrets(record: &Record) -> Option<Vec<LocalObjectReference>> {
+    (!record.image_pull_secrets.is_empty()).then(|| {
+        record
+            .image_pull_secrets
+            .iter()
+            .map(|name| LocalObjectReference { name: name.clone() })
+            .collect()
+    })
+}
+
+/// The name of the pod that empties `id`'s workspace.
+pub(crate) fn cleanup_pod_name(id: &str) -> String {
+    format!("{id}-cleanup")
+}
+
+/// The pod that empties a stopped sandbox's workspace on `node`: the
+/// sandbox's own image (already on that node), pinned there, mounting the
+/// workspace that must already exist, and asking for no more than
+/// [`CLEANUP_CPU`] and [`CLEANUP_MEMORY`] rather than the sandbox's declared
+/// resources. It removes the workspace contents and exits.
+pub(crate) fn build_cleanup_pod(record: &Record, node: &str, owner: &str) -> Result<Pod> {
+    let quantities = BTreeMap::from([
+        ("cpu".to_owned(), Quantity(CLEANUP_CPU.to_owned())),
+        ("memory".to_owned(), Quantity(CLEANUP_MEMORY.to_owned())),
+    ]);
+    let run_as_user = record
+        .user
+        .as_deref()
+        .and_then(|user| user.parse::<i64>().ok());
+    let script = format!(
+        "find {} -mindepth 1 -maxdepth 1 -exec rm -rf {{}} +",
+        crate::exec::shell_quote(&record.working_dir)
+    );
+    let mut labels = BTreeMap::from([
+        (MANAGED_LABEL.to_owned(), MANAGED_VALUE.to_owned()),
+        (CLEANUP_OF_LABEL.to_owned(), record.id.clone()),
+    ]);
+    if let Some(factory) = &record.factory {
+        let value = crate::labels::encode_label_value(factory)
+            .map_err(|reason| Error::invalid_spec("factory", reason))?;
+        labels.insert(FACTORY_LABEL.to_owned(), value);
+    }
+    Ok(Pod {
+        metadata: ObjectMeta {
+            name: Some(cleanup_pod_name(&record.id)),
+            namespace: Some(record.namespace.clone()),
+            labels: Some(labels),
+            annotations: Some(BTreeMap::from([(
+                CLEANUP_OWNER_ANNOTATION.to_owned(),
+                owner.to_owned(),
+            )])),
+            ..ObjectMeta::default()
+        },
+        spec: Some(PodSpec {
+            restart_policy: Some("Never".to_owned()),
+            termination_grace_period_seconds: Some(1),
+            service_account_name: record.service_account.clone(),
+            automount_service_account_token: Some(false),
+            enable_service_links: Some(false),
+            affinity: Some(pinned_to(node)),
+            tolerations: tolerations(record),
+            image_pull_secrets: image_pull_secrets(record),
+            security_context: security_context(run_as_user, record),
+            containers: vec![Container {
+                name: CLEANUP_CONTAINER_NAME.to_owned(),
+                image: Some(record.image.clone()),
+                command: Some(vec!["/bin/sh".to_owned(), "-c".to_owned(), script]),
+                working_dir: Some("/".to_owned()),
+                resources: Some(ResourceRequirements {
+                    requests: Some(quantities.clone()),
+                    limits: Some(quantities),
+                    ..ResourceRequirements::default()
+                }),
+                volume_mounts: Some(vec![VolumeMount {
+                    name: "workspace".to_owned(),
+                    mount_path: record.working_dir.clone(),
+                    ..VolumeMount::default()
+                }]),
+                ..Container::default()
+            }],
+            volumes: Some(vec![Volume {
+                name: "workspace".to_owned(),
+                host_path: Some(HostPathVolumeSource {
+                    path: record.workspace_dir.clone(),
+                    type_: Some("Directory".to_owned()),
+                }),
+                ..Volume::default()
+            }]),
+            ..PodSpec::default()
+        }),
+        status: None,
+    })
+}
+
 pub(crate) fn build_pod(record: &Record, incarnation: Incarnation) -> Result<Pod> {
     let env = record
         .env
@@ -155,26 +301,7 @@ pub(crate) fn build_pod(record: &Record, incarnation: Incarnation) -> Result<Pod
     };
     // A pod pinned to its sandbox's node has nowhere to spread to.
     let (node_selector, affinity, topology_spread) = match &record.node {
-        Some(node) => (
-            None,
-            Some(Affinity {
-                node_affinity: Some(NodeAffinity {
-                    required_during_scheduling_ignored_during_execution: Some(NodeSelector {
-                        node_selector_terms: vec![NodeSelectorTerm {
-                            match_expressions: Some(vec![NodeSelectorRequirement {
-                                key: HOSTNAME_LABEL.to_owned(),
-                                operator: "In".to_owned(),
-                                values: Some(vec![node.clone()]),
-                            }]),
-                            match_fields: None,
-                        }],
-                    }),
-                    ..NodeAffinity::default()
-                }),
-                ..Affinity::default()
-            }),
-            None,
-        ),
+        Some(node) => (None, Some(pinned_to(node)), None),
         None => (
             (!record.node_selector.is_empty()).then(|| record.node_selector.clone()),
             None,
@@ -210,26 +337,8 @@ pub(crate) fn build_pod(record: &Record, incarnation: Incarnation) -> Result<Pod
             node_selector,
             affinity,
             topology_spread_constraints: topology_spread,
-            tolerations: (!record.tolerations.is_empty()).then(|| {
-                record
-                    .tolerations
-                    .iter()
-                    .map(|t| Toleration {
-                        key: t.key.clone(),
-                        operator: t.operator.clone(),
-                        value: t.value.clone(),
-                        effect: t.effect.clone(),
-                        toleration_seconds: None,
-                    })
-                    .collect()
-            }),
-            image_pull_secrets: (!record.image_pull_secrets.is_empty()).then(|| {
-                record
-                    .image_pull_secrets
-                    .iter()
-                    .map(|name| LocalObjectReference { name: name.clone() })
-                    .collect()
-            }),
+            tolerations: tolerations(record),
+            image_pull_secrets: image_pull_secrets(record),
             security_context: security_context(run_as_user, record),
             containers: vec![Container {
                 name: CONTAINER_NAME.to_owned(),
@@ -397,22 +506,8 @@ impl Cluster {
     /// Deletes the pod and waits until it is gone from the API, not merely
     /// terminating: the stop half of the single-writer fence.
     pub(crate) async fn delete_pod_and_wait(&self, name: &str, timeout: Duration) -> Result<()> {
-        let namespace = self.namespace.clone();
-        let result = self
-            .client
-            .call(|client| {
-                let namespace = namespace.clone();
-                async move {
-                    Api::<Pod>::namespaced(client, &namespace)
-                        .delete(name, &DeleteParams::default().grace_period(5))
-                        .await
-                }
-            })
-            .await;
-        match result {
-            Ok(_) => {}
-            Err(error) if is_not_found(&error) => return Ok(()),
-            Err(error) => return Err(kube_error("deleting the sandbox pod", error)),
+        if !self.delete_pod(name).await? {
+            return Ok(());
         }
         let started = Instant::now();
         loop {
@@ -426,6 +521,28 @@ impl Cluster {
                 });
             }
             tokio::time::sleep(POLL).await;
+        }
+    }
+
+    /// Asks for the pod's deletion without waiting; `false` when it was
+    /// already gone.
+    pub(crate) async fn delete_pod(&self, name: &str) -> Result<bool> {
+        let namespace = self.namespace.clone();
+        let result = self
+            .client
+            .call(|client| {
+                let namespace = namespace.clone();
+                async move {
+                    Api::<Pod>::namespaced(client, &namespace)
+                        .delete(name, &DeleteParams::default().grace_period(5))
+                        .await
+                }
+            })
+            .await;
+        match result {
+            Ok(_) => Ok(true),
+            Err(error) if is_not_found(&error) => Ok(false),
+            Err(error) => Err(kube_error("deleting the sandbox pod", error)),
         }
     }
 
@@ -552,6 +669,35 @@ impl Cluster {
         }
     }
 
+    /// Waits for a run-to-completion pod to end; returns its final phase, or
+    /// [`NO_WORKSPACE`] when its workspace mount can never succeed. Fails
+    /// when the pod disappears first, or after `timeout`.
+    pub(crate) async fn wait_ended(&self, name: &str, timeout: Duration) -> Result<String> {
+        let started = Instant::now();
+        loop {
+            let Some(pod) = self.get_pod(name).await? else {
+                return Err(provider(format!("pod {name} disappeared before it ended")));
+            };
+            if let Some(phase @ ("Succeeded" | "Failed")) = pod
+                .status
+                .as_ref()
+                .and_then(|status| status.phase.as_deref())
+            {
+                return Ok(phase.to_owned());
+            }
+            if self.failed_mount(name).await?.is_some() {
+                return Ok(NO_WORKSPACE.to_owned());
+            }
+            if started.elapsed() >= timeout {
+                return Err(Error::Timeout {
+                    operation: format!("waiting for pod {name} to end"),
+                    elapsed: started.elapsed(),
+                });
+            }
+            tokio::time::sleep(POLL).await;
+        }
+    }
+
     async fn failed_mount(&self, name: &str) -> Result<Option<String>> {
         let namespace = self.namespace.clone();
         let selector = format!("involvedObject.name={name},reason=FailedMount");
@@ -640,6 +786,73 @@ mod tests {
             image_pull_secrets: Vec::new(),
             factory: Some("hp".to_owned()),
         }
+    }
+
+    #[test]
+    fn a_cleanup_pod_is_minimal_pinned_and_never_the_sandbox() {
+        let mut record = record();
+        record.resources.cpu_cores = Some(4);
+        record.resources.memory_mb = Some(8192);
+        let pod = build_cleanup_pod(&record, "node-a", "host/1/2").expect("builds");
+        let meta = &pod.metadata;
+        assert_eq!(meta.name.as_deref(), Some("petri-01jabc-l1-cleanup"));
+        let labels = meta.labels.clone().expect("labels");
+        assert_eq!(
+            labels.get(CLEANUP_OF_LABEL).map(String::as_str),
+            Some("petri-01jabc-l1")
+        );
+        assert!(
+            !labels.contains_key(SANDBOX_LABEL),
+            "a cleanup pod must not read as the sandbox"
+        );
+        assert_eq!(
+            meta.annotations
+                .clone()
+                .expect("annotations")
+                .get(CLEANUP_OWNER_ANNOTATION)
+                .map(String::as_str),
+            Some("host/1/2")
+        );
+        let spec = pod.spec.expect("spec");
+        assert_eq!(spec.restart_policy.as_deref(), Some("Never"));
+        let terms = spec
+            .affinity
+            .and_then(|a| a.node_affinity)
+            .and_then(|n| n.required_during_scheduling_ignored_during_execution)
+            .expect("pinned")
+            .node_selector_terms;
+        assert_eq!(
+            terms[0].match_expressions.as_ref().expect("expressions")[0].values,
+            Some(vec!["node-a".to_owned()])
+        );
+        let container = &spec.containers[0];
+        let resources = container.resources.clone().expect("resources");
+        for quantities in [
+            resources.requests.expect("requests"),
+            resources.limits.expect("limits"),
+        ] {
+            assert_eq!(
+                quantities.get("cpu"),
+                Some(&Quantity(CLEANUP_CPU.to_owned()))
+            );
+            assert_eq!(
+                quantities.get("memory"),
+                Some(&Quantity(CLEANUP_MEMORY.to_owned()))
+            );
+        }
+        assert_eq!(CLEANUP_CPU, "100m");
+        assert_eq!(CLEANUP_MEMORY, "128Mi");
+        let volume = &spec.volumes.expect("volumes")[0];
+        let host_path = volume.host_path.as_ref().expect("hostPath");
+        assert_eq!(host_path.path, "/ws/petri-01jabc-l1");
+        assert_eq!(
+            host_path.type_.as_deref(),
+            Some("Directory"),
+            "a cleanup never creates a workspace"
+        );
+        let command = container.command.clone().expect("command").join(" ");
+        assert!(command.contains("rm -rf"), "{command}");
+        assert!(command.contains("/workspace"), "{command}");
     }
 
     #[test]

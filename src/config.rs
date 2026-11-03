@@ -52,6 +52,11 @@ pub struct KubernetesConfig {
     pub start_timeout_secs: u64,
     /// Seconds `stop` waits for a pod to be gone from the API.
     pub stop_timeout_secs: u64,
+    /// Seconds a delete waits for the cleanup pod that empties a stopped
+    /// sandbox's workspace to finish. Past it the delete removes that pod and
+    /// fails, keeping the record so a later delete tries again. A cleanup pod
+    /// older than this is removed by any provider call that finds it.
+    pub cleanup_timeout_secs: u64,
     /// A command (argv) that rewrites the kubeconfig file, run on a `401`
     /// before the file is re-read. Empty when something else keeps the file
     /// current.
@@ -121,6 +126,7 @@ impl Default for KubernetesConfig {
             factory: None,
             start_timeout_secs: 600,
             stop_timeout_secs: 120,
+            cleanup_timeout_secs: 300,
             refresh_command: Vec::new(),
             refresh_timeout_secs: 60,
         }
