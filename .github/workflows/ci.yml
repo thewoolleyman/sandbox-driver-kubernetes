@@ -33,10 +33,11 @@ jobs:
           cluster_name: sdk
           config: ci/kind.yaml
           kubeconfig: /home/runner/.kube/kind-sdk
+      # Pulled by the node's own containerd. `kind load docker-image` stopped
+      # working on 2026-11-03: the runner's Docker exports an image whose
+      # content digests the node's ctr import cannot find.
       - name: Pre-pull the test image into the node
-        run: |
-          docker pull ghcr.io/lithoscomputer/ubuntu-24.04:slim-df708f910111
-          kind load docker-image ghcr.io/lithoscomputer/ubuntu-24.04:slim-df708f910111 --name sdk
+        run: docker exec sdk-control-plane crictl pull ghcr.io/lithoscomputer/ubuntu-24.04:slim-df708f910111
       - name: Cluster tests
         env:
           SANDBOX_DRIVER_KUBERNETES_TEST_KUBECONFIG: /home/runner/.kube/kind-sdk
