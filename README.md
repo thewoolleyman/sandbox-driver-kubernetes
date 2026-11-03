@@ -28,6 +28,14 @@ pins). Fabro and Petri do not yet launch a plugin backend or forward workflow re
 - **Lifecycle fence:** `stop` deletes the pod and waits until it is gone from the API; `start`
   re-creates it from the record and refuses while a pod of that name still exists; `delete`
   empties the workspace and removes pod, network policy and record.
+- **Deleting a stopped sandbox:** its workspace is emptied by a short-lived cleanup pod
+  `<sandbox id>-cleanup`. That pod is pinned to the workspace's node and limited to 100m CPU and
+  128Mi memory, so it never re-creates the full sandbox pod with its declared resources. The
+  delete always removes the cleanup pod. If the cleanup does not finish within
+  `cleanup_timeout_secs`, the delete fails with a timeout naming the sandbox and keeps the record,
+  so a later delete can retry. A cleanup pod carries its plugin process's identity. The next
+  `list` (or the next `delete` of that sandbox) removes one whose process has ended, so an
+  interrupted delete cannot leave it behind.
 - **Node name:** once the pod is scheduled, `sandbox/environment` reports the node it runs on as
   `K8S_NODE_NAME`, so a caller that only sees the provider's environment map (Petri passes it
   through unchanged) can name the node, for example on its telemetry. A caller-supplied
@@ -70,6 +78,7 @@ factory = "hp"                              # sets the livespec.dispatch.factory
 # rewritten on demand (a pull-on-401 file). Empty by default.
 refresh_command = ["sudo", "-n", "/usr/local/bin/refresh-factory-kubeconfig"]
 refresh_timeout_secs = 60
+cleanup_timeout_secs = 300                  # how long a delete waits for its workspace cleanup pod
 
 # A node-loaded AppArmor profile for sandbox pods. Needed where the kernel stacks an
 # exec'd process as `<profile>//&unconfined` (e.g. Ubuntu 26.04): the runtime default

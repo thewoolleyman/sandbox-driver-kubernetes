@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use k8s_openapi::api::core::v1::Pod;
@@ -18,8 +18,8 @@ use crate::error::{kube_error, provider, record_io};
 use crate::exec::{KubernetesExec, shell_quote};
 use crate::fs::KubernetesFs;
 use crate::pod::{
-    Cluster, Incarnation, NodeHealth, build_network_policy, build_pod, node_unavailable,
-    object_labels,
+    Cluster, Incarnation, NodeHealth, build_cleanup_pod, build_network_policy, build_pod,
+    cleanup_pod_name, node_unavailable, object_labels,
 };
 use crate::record::{Record, RecordStore};
 use crate::{LABELS_ANNOTATION, RUNTIME_DIRECTORY};
@@ -29,6 +29,7 @@ use crate::{LABELS_ANNOTATION, RUNTIME_DIRECTORY};
 pub(crate) struct Timeouts {
     pub(crate) start: Duration,
     pub(crate) stop: Duration,
+    pub(crate) cleanup: Duration,
 }
 
 /// A sandbox backed by one pod and its host-side record.
@@ -155,7 +156,58 @@ impl KubernetesSandbox {
         }
     }
 
+    /// Empties the workspace of a sandbox whose pod is gone, through a
+    /// minimal cleanup pod on its node. The cleanup pod is removed whatever
+    /// happens; when it does not finish within the cleanup window the delete
+    /// fails, naming the sandbox and the time it waited.
+    async fn clear_workspace_through_cleanup_pod(&self, node: &str) -> Result<()> {
+        let record = self.record.lock().await.clone();
+        let name = cleanup_pod_name(&record.id);
+        let pod = build_cleanup_pod(&record, node, &crate::owner::this_process())?;
+        if let Err(error) = self.cluster.create_pod(&pod).await {
+            // Best effort, as before: a cleanup that cannot even start leaves
+            // the workspace behind but must not keep the sandbox undeletable.
+            tracing::warn!(sandbox_id = %self.id, error = %error, "creating the cleanup pod failed");
+            return Ok(());
+        }
+        let started = Instant::now();
+        let ended = self.cluster.wait_ended(&name, self.timeouts.cleanup).await;
+        let elapsed = started.elapsed();
+        let removed = self
+            .cluster
+            .delete_pod_and_wait(&name, self.timeouts.stop)
+            .await;
+        match ended {
+            Ok(phase) if phase == crate::pod::NO_WORKSPACE => {
+                tracing::warn!(sandbox_id = %self.id, "the workspace directory is already gone from its node");
+            }
+            Ok(phase) if phase == "Failed" => {
+                tracing::warn!(sandbox_id = %self.id, "the cleanup pod could not empty the whole workspace");
+            }
+            Ok(_) => {}
+            Err(error) => {
+                if let Err(removal) = removed {
+                    tracing::warn!(sandbox_id = %self.id, error = %removal, "removing the cleanup pod failed");
+                }
+                return Err(Error::Timeout {
+                    operation: format!(
+                        "emptying the workspace of sandbox {} through its cleanup pod ({error}); \
+                         the cleanup pod was removed and the sandbox record kept",
+                        self.id
+                    ),
+                    elapsed,
+                });
+            }
+        }
+        removed
+    }
+
     pub(crate) async fn delete_inner(&self) -> Result<()> {
+        // A cleanup pod an interrupted delete left behind is ours to remove:
+        // this delete owns the sandbox's workspace now.
+        self.cluster
+            .delete_pod_and_wait(&cleanup_pod_name(self.id.as_str()), self.timeouts.stop)
+            .await?;
         let pod = self.cluster.get_pod(self.id.as_str()).await?;
         let running = pod
             .as_ref()
@@ -164,16 +216,14 @@ impl KubernetesSandbox {
             == Some("Running");
         if running {
             self.clear_workspace().await;
-        } else {
-            // The workspace lives on the node; bring a pod back over it so it
-            // can be emptied, unless the node cannot run one.
+        } else if pod.is_none() {
+            // The workspace lives on the node. Empty it through a minimal
+            // cleanup pod there, never a re-creation of the full sandbox pod,
+            // unless the node cannot run one.
             let node = self.record.lock().await.node.clone();
             if let Some(node) = node {
-                if pod.is_none()
-                    && self.cluster.node_ready(&node).await? == NodeHealth::Ready
-                    && self.launch(Incarnation::Recreate).await.is_ok()
-                {
-                    self.clear_workspace().await;
+                if self.cluster.node_ready(&node).await? == NodeHealth::Ready {
+                    self.clear_workspace_through_cleanup_pod(&node).await?;
                 }
             }
         }
