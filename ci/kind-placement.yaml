@@ -1,0 +1,13 @@
+# Two factory workers for the placement proof (tests/placement_scoring.rs).
+# The control-plane keeps kind's control-plane taint and carries no factory
+# label, so only the two workers can take a factory pod.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+  - role: worker
+    labels:
+      ci-runner.io/factory: "true"
+  - role: worker
+    labels:
+      ci-runner.io/factory: "true"
