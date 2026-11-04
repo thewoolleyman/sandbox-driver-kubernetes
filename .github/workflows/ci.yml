@@ -44,3 +44,25 @@ jobs:
           SANDBOX_DRIVER_KUBERNETES_TEST_KIND_NODE: sdk-control-plane
           RUST_LOG: sandbox_driver_kubernetes=debug
         run: cargo test --tests --no-fail-fast -- --nocapture --test-threads 1
+
+  # The scheduler behaviour a host-side pressure reconciler relies on
+  # (orchestrator bd-ib-plon2p): a PreferNoSchedule taint outweighs the
+  # sandbox pod's hostname topology spread, and never leaves a pod Pending.
+  # Its own two-worker cluster, so the single-node cluster job is untouched.
+  placement:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: helm/kind-action@v1.12.0
+        with:
+          cluster_name: sdkp
+          config: ci/kind-placement.yaml
+          kubeconfig: /home/runner/.kube/kind-sdkp
+      - name: Placement proof
+        env:
+          SANDBOX_DRIVER_KUBERNETES_TEST_KUBECONFIG: /home/runner/.kube/kind-sdkp
+          SANDBOX_DRIVER_KUBERNETES_TEST_PLACEMENT: "1"
+        run: cargo test --test placement_scoring -- --nocapture
