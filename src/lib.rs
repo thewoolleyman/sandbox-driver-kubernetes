@@ -44,12 +44,15 @@ mod client;
 mod config;
 mod error;
 mod exec;
+#[cfg(test)]
+mod fake_api;
 mod fs;
 mod labels;
 mod owner;
 mod pod;
 mod provider;
 mod record;
+mod resume;
 mod sandbox;
 
 pub use crate::client::KubeClient;
