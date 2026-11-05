@@ -170,6 +170,64 @@ async fn requests_and_limits_equal_the_declared_resources() {
     sandbox.delete().await.expect("deletes");
 }
 
+/// Assertion 2b: a configured CPU request sits under the spec's CPU limit,
+/// and a request above the limit is refused before any pod exists.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_configured_cpu_request_sits_under_the_limit() {
+    let Some(mut config) = support::config("cpu-request") else {
+        return;
+    };
+    config.cpu_request_cores = Some("0.5".to_owned());
+    let provider = KubernetesProvider::connect(config).await.expect("connects");
+    let client = provider.client().current().await;
+    support::ensure_namespace(client.clone()).await;
+    let mut resources = Resources::default();
+    resources.cpu_cores = Some(1);
+    resources.memory_mb = Some(512);
+    let sandbox = provider
+        .create(&spec().resources(resources), None)
+        .await
+        .expect("creates");
+    let pod = pod(client.clone(), sandbox.id().as_str())
+        .await
+        .expect("pod");
+    let qos = pod
+        .status
+        .as_ref()
+        .and_then(|status| status.qos_class.clone());
+    let container = &pod.spec.expect("spec").containers[0];
+    let requirements = container.resources.clone().expect("resources");
+    let requests = requirements.requests.expect("requests");
+    let limits = requirements.limits.expect("limits");
+    assert_eq!(requests["cpu"].0, "500m");
+    assert_eq!(limits["cpu"].0, "1");
+    assert_eq!(requests["memory"], limits["memory"]);
+    assert_eq!(qos.as_deref(), Some("Burstable"));
+    sandbox.delete().await.expect("deletes");
+
+    let before = pods(client.clone()).await.len();
+    // A 0.5-core request over a zero-core limit, and over no limit at all.
+    let mut over = Resources::default();
+    over.cpu_cores = Some(0);
+    over.memory_mb = Some(512);
+    let mut unlimited = Resources::default();
+    unlimited.memory_mb = Some(512);
+    for refused in [over, unlimited] {
+        assert!(matches!(
+            provider
+                .create(&spec().resources(refused), None)
+                .await
+                .err(),
+            Some(Error::InvalidSpec { .. })
+        ));
+    }
+    assert_eq!(
+        pods(client).await.len(),
+        before,
+        "a refused CPU request created no pod"
+    );
+}
+
 /// Assertion 3: refused requests create nothing.
 #[tokio::test(flavor = "multi_thread")]
 async fn refused_requests_create_no_pod() {

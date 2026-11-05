@@ -63,6 +63,14 @@ pub struct KubernetesConfig {
     pub refresh_command: Vec<String>,
     /// Seconds the refresh command may run.
     pub refresh_timeout_secs: u64,
+    /// The CPU, in cores, a sandbox pod requests, below its limit. The limit
+    /// is always the spec's `resources.cpu_cores`. Unset, the request equals
+    /// the limit (Guaranteed QoS). Kept as written and checked at sandbox
+    /// create, so an unparseable, non-positive or over-limit value refuses
+    /// the create that would use it rather than the plugin's start. Set from
+    /// `SANDBOX_DRIVER_KUBERNETES_CPU_REQUEST_CORES`, which a host renders
+    /// per provider, so one host can size two provider kinds differently.
+    pub cpu_request_cores: Option<String>,
 }
 
 /// One topology spread constraint, in the Kubernetes field names. Its label
@@ -129,6 +137,7 @@ impl Default for KubernetesConfig {
             cleanup_timeout_secs: 300,
             refresh_command: Vec::new(),
             refresh_timeout_secs: 60,
+            cpu_request_cores: None,
         }
     }
 }
@@ -187,7 +196,12 @@ impl KubernetesConfig {
     }
 
     fn apply_env(&mut self) {
-        let var = |name: &str| env::var(format!("SANDBOX_DRIVER_KUBERNETES_{name}")).ok();
+        self.apply_env_from(|name| env::var(name).ok());
+    }
+
+    /// Applies the `SANDBOX_DRIVER_KUBERNETES_*` overrides `lookup` returns.
+    fn apply_env_from(&mut self, lookup: impl Fn(&str) -> Option<String>) {
+        let var = |name: &str| lookup(&format!("SANDBOX_DRIVER_KUBERNETES_{name}"));
         if let Some(value) = var("KUBECONFIG") {
             self.kubeconfig = PathBuf::from(value);
         }
@@ -208,6 +222,9 @@ impl KubernetesConfig {
         }
         if let Some(value) = var("FACTORY") {
             self.factory = Some(value);
+        }
+        if let Some(value) = var("CPU_REQUEST_CORES") {
+            self.cpu_request_cores = Some(value);
         }
         if let Some(value) = var("NODE_SELECTOR") {
             self.node_selector = value
@@ -238,6 +255,31 @@ mod tests {
         assert_eq!(parsed.namespace, "x");
         assert_eq!(parsed.workspace_root, "/data/ws");
         assert!(toml::from_str::<KubernetesConfig>("bogus = 1\n").is_err());
+    }
+
+    #[test]
+    fn a_cpu_request_is_unset_by_default_and_read_as_written() {
+        assert_eq!(KubernetesConfig::default().cpu_request_cores, None);
+        let parsed: KubernetesConfig =
+            toml::from_str("cpu_request_cores = \"3\"\n").expect("parses");
+        assert_eq!(parsed.cpu_request_cores.as_deref(), Some("3"));
+        // Kept as written: a bad value is refused at create, not at load.
+        let bad: KubernetesConfig =
+            toml::from_str("cpu_request_cores = \"three\"\n").expect("parses");
+        assert_eq!(bad.cpu_request_cores.as_deref(), Some("three"));
+    }
+
+    #[test]
+    fn the_cpu_request_environment_variable_overrides_the_file() {
+        let mut config: KubernetesConfig =
+            toml::from_str("cpu_request_cores = \"2\"\n").expect("parses");
+        config.apply_env_from(|name| {
+            (name == "SANDBOX_DRIVER_KUBERNETES_CPU_REQUEST_CORES").then(|| "3".to_owned())
+        });
+        assert_eq!(config.cpu_request_cores.as_deref(), Some("3"));
+        let mut unset = KubernetesConfig::default();
+        unset.apply_env_from(|_| None);
+        assert_eq!(unset.cpu_request_cores, None);
     }
 
     #[test]

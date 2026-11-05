@@ -54,6 +54,11 @@ pub struct Record {
     pub service_account: Option<String>,
     pub image_pull_secrets: Vec<String>,
     pub factory: Option<String>,
+    /// The configured CPU request below the limit, as written, so a pod the
+    /// record re-creates requests what the first one did. Omitted when unset,
+    /// so a record without it is written exactly as before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_request_cores: Option<String>,
 }
 
 /// The environment key under which [`Record::ambient_environment`] reports
@@ -192,7 +197,30 @@ mod tests {
             service_account: None,
             image_pull_secrets: Vec::new(),
             factory: None,
+            cpu_request_cores: None,
         }
+    }
+
+    #[test]
+    fn an_unset_cpu_request_is_absent_from_the_record_and_a_set_one_round_trips() {
+        let unset = record("petri-a-l1");
+        let json = serde_json::to_value(&unset).expect("serializes");
+        assert!(
+            json.get("cpu_request_cores").is_none(),
+            "an unset request leaves the record as before: {json}"
+        );
+        let mut legacy = json.clone();
+        legacy
+            .as_object_mut()
+            .expect("object")
+            .remove("cpu_request_cores");
+        let loaded: Record = serde_json::from_value(legacy).expect("an older record loads");
+        assert_eq!(loaded.cpu_request_cores, None);
+        let mut set = record("petri-a-l2");
+        set.cpu_request_cores = Some("3".to_owned());
+        let back: Record =
+            serde_json::from_value(serde_json::to_value(&set).expect("serializes")).expect("loads");
+        assert_eq!(back.cpu_request_cores.as_deref(), Some("3"));
     }
 
     #[test]
