@@ -50,6 +50,19 @@ pins). Fabro and Petri do not yet launch a plugin backend or forward workflow re
   failures are retried, so nothing reached the server and a command is never started twice; a
   failure after connecting is returned as before. A refusal outlasting the budget is a retryable
   error (`code: api-unreachable`) naming the operation, the attempts and the elapsed time.
+- **Dropped exec streams:** a command never writes to an exec stream. A launch exec starts it
+  under a detached supervisor that appends its stdout and stderr to files in
+  `/tmp/.sandbox-driver` and records its exit status there; a follower exec streams those files
+  by byte offset. When the API connection drops while the pod and node stay Ready (a k3s server
+  restart), the driver re-attaches a follower at the offsets it has received, so the command's
+  output and exit status are exactly what they would have been. Stdin, including a stdio
+  session's (an ACP agent's turn), goes to an input file in chunks: each chunk is one short exec
+  that appends it only when the file ends at the chunk's offset, and its status confirms it, so a
+  resend after a drop loses and repeats nothing. Each stdin chunk costs one exec. An outage longer than
+  three minutes fails the command as `the exec stream ended without an exit status; the sandbox
+  became unreachable`. Each command costs two execs (launch and follow), as before; the
+  in-sandbox loops poll every 100 ms, so a command's output and a stdio session's replies can
+  lag by up to that much.
 - **Labels:** values Kubernetes cannot carry (Petri's `petri.workspace` contains `/`) are encoded
   injectively and reversibly (`x_` prefix, `_hh` escapes); an encoding over 63 characters is
   refused, never truncated. Verbatim values are kept in annotations.
