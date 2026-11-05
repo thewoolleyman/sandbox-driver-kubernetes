@@ -56,9 +56,20 @@ pub(crate) enum Incarnation {
     Recreate,
 }
 
+/// The configuration key, and the environment variable that sets it, named
+/// in a refused CPU request.
+const CPU_REQUEST_FIELD: &str = "cpu_request_cores (SANDBOX_DRIVER_KUBERNETES_CPU_REQUEST_CORES)";
+
 /// Validates the spec's resources and renders them as requests equal to
-/// limits.
-pub(crate) fn resource_requirements(resources: &Resources) -> Result<Option<ResourceRequirements>> {
+/// limits, except that a configured `cpu_request` (cores, as written) is the
+/// CPU request while `cpu_cores` stays the CPU limit. Memory and disk are
+/// always requested at their limits. A request that does not parse as a
+/// number of cores, is not positive, exceeds the limit, or has no limit to sit
+/// under is refused, never clamped.
+pub(crate) fn resource_requirements(
+    resources: &Resources,
+    cpu_request: Option<&str>,
+) -> Result<Option<ResourceRequirements>> {
     if resources.gpus.is_some_and(|gpus| gpus > 0) {
         return Err(Error::invalid_spec(
             "resources.gpus",
@@ -66,6 +77,9 @@ pub(crate) fn resource_requirements(resources: &Resources) -> Result<Option<Reso
              resource",
         ));
     }
+    let request_millicores = cpu_request
+        .map(|written| cpu_request_millicores(written, resources.cpu_cores))
+        .transpose()?;
     let mut quantities = BTreeMap::new();
     if let Some(cpu) = resources.cpu_cores {
         quantities.insert("cpu".to_owned(), Quantity(cpu.to_string()));
@@ -82,11 +96,62 @@ pub(crate) fn resource_requirements(resources: &Resources) -> Result<Option<Reso
     if quantities.is_empty() {
         return Ok(None);
     }
+    let mut requests = quantities.clone();
+    if let Some(millicores) = request_millicores {
+        requests.insert("cpu".to_owned(), Quantity(cpu_quantity(millicores)));
+    }
     Ok(Some(ResourceRequirements {
-        requests: Some(quantities.clone()),
+        requests: Some(requests),
         limits: Some(quantities),
         ..ResourceRequirements::default()
     }))
+}
+
+/// The configured CPU request in millicores, checked against the limit.
+fn cpu_request_millicores(written: &str, limit_cores: Option<u32>) -> Result<u64> {
+    let refuse = |reason: String| Err(Error::invalid_spec(CPU_REQUEST_FIELD, reason));
+    let Ok(cores) = written.trim().parse::<f64>() else {
+        return refuse(format!(
+            "{written:?} is not a number of CPU cores (for example \"3\" or \"2.5\")"
+        ));
+    };
+    if !cores.is_finite() {
+        return refuse(format!("{written:?} is not a finite number of CPU cores"));
+    }
+    // Kubernetes resolves CPU to whole millicores.
+    let millicores = (cores * 1000.0).round();
+    if millicores < 1.0 {
+        return refuse(format!(
+            "{written:?} is not a positive CPU request (the smallest is 0.001 cores)"
+        ));
+    }
+    let Some(limit) = limit_cores else {
+        return refuse(format!(
+            "a CPU request of {written:?} needs a CPU limit to sit under, and the spec sets no \
+             resources.cpu_cores"
+        ));
+    };
+    if millicores > f64::from(limit) * 1000.0 {
+        return refuse(format!(
+            "a CPU request of {written:?} cores exceeds the spec's CPU limit of {limit} cores \
+             (resources.cpu_cores)"
+        ));
+    }
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "positive, rounded, and at most the u32 limit times 1000"
+    )]
+    Ok(millicores as u64)
+}
+
+/// A CPU quantity: whole cores when exact, otherwise millicores.
+fn cpu_quantity(millicores: u64) -> String {
+    if millicores % 1000 == 0 {
+        (millicores / 1000).to_string()
+    } else {
+        format!("{millicores}m")
+    }
 }
 
 /// The labels every object of a sandbox carries, plus the sandbox's own
@@ -346,7 +411,10 @@ pub(crate) fn build_pod(record: &Record, incarnation: Incarnation) -> Result<Pod
                 command: Some(vec!["/bin/sh".to_owned(), "-c".to_owned(), idle]),
                 working_dir: Some(record.working_dir.clone()),
                 env: (!env.is_empty()).then_some(env),
-                resources: resource_requirements(&record.resources)?,
+                resources: resource_requirements(
+                    &record.resources,
+                    record.cpu_request_cores.as_deref(),
+                )?,
                 volume_mounts: Some(vec![VolumeMount {
                     name: "workspace".to_owned(),
                     mount_path: record.working_dir.clone(),
@@ -785,6 +853,7 @@ mod tests {
             service_account: Some("sa".to_owned()),
             image_pull_secrets: Vec::new(),
             factory: Some("hp".to_owned()),
+            cpu_request_cores: None,
         }
     }
 
@@ -860,7 +929,7 @@ mod tests {
         let mut resources = Resources::default();
         resources.cpu_cores = Some(4);
         resources.memory_mb = Some(8192);
-        let rendered = resource_requirements(&resources)
+        let rendered = resource_requirements(&resources, None)
             .expect("ok")
             .expect("some");
         assert_eq!(rendered.requests, rendered.limits);
@@ -868,7 +937,95 @@ mod tests {
         assert_eq!(limits["cpu"], Quantity("4".to_owned()));
         assert_eq!(limits["memory"], Quantity("8192Mi".to_owned()));
         resources.gpus = Some(1);
-        assert!(resource_requirements(&resources).is_err());
+        assert!(resource_requirements(&resources, None).is_err());
+    }
+
+    fn quantity(map: &Option<BTreeMap<String, Quantity>>, key: &str) -> String {
+        map.as_ref().expect("quantities")[key].0.clone()
+    }
+
+    #[test]
+    fn a_configured_cpu_request_sits_under_the_cpu_limit() {
+        let mut resources = Resources::default();
+        resources.cpu_cores = Some(6);
+        resources.memory_mb = Some(7629);
+        resources.disk_mb = Some(2048);
+        let rendered = resource_requirements(&resources, Some("3"))
+            .expect("ok")
+            .expect("some");
+        assert_eq!(quantity(&rendered.requests, "cpu"), "3");
+        assert_eq!(quantity(&rendered.limits, "cpu"), "6");
+        // Memory and disk stay requested at their limits.
+        for key in ["memory", "ephemeral-storage"] {
+            assert_eq!(
+                quantity(&rendered.requests, key),
+                quantity(&rendered.limits, key),
+                "{key}"
+            );
+        }
+        assert_eq!(quantity(&rendered.requests, "memory"), "7629Mi");
+        // A fractional request is millicores; one equal to the limit is allowed.
+        let fractional = resource_requirements(&resources, Some(" 2.5 "))
+            .expect("ok")
+            .expect("some");
+        assert_eq!(quantity(&fractional.requests, "cpu"), "2500m");
+        let equal = resource_requirements(&resources, Some("6"))
+            .expect("ok")
+            .expect("some");
+        assert_eq!(equal.requests, equal.limits);
+    }
+
+    #[test]
+    fn a_bad_cpu_request_is_refused_naming_the_setting() {
+        let mut resources = Resources::default();
+        resources.cpu_cores = Some(4);
+        resources.memory_mb = Some(7629);
+        for (written, why) in [
+            ("5", "exceeds the spec's CPU limit of 4 cores"),
+            ("4.001", "exceeds the spec's CPU limit of 4 cores"),
+            ("0", "not a positive CPU request"),
+            ("-1", "not a positive CPU request"),
+            ("0.0001", "not a positive CPU request"),
+            ("three", "not a number of CPU cores"),
+            ("3000m", "not a number of CPU cores"),
+            ("", "not a number of CPU cores"),
+            ("NaN", "not a finite number"),
+            ("inf", "not a finite number"),
+        ] {
+            let Err(Error::InvalidSpec { field, reason }) =
+                resource_requirements(&resources, Some(written))
+            else {
+                panic!("{written:?} must be refused");
+            };
+            assert_eq!(field, CPU_REQUEST_FIELD, "{written:?}");
+            assert!(field.contains("SANDBOX_DRIVER_KUBERNETES_CPU_REQUEST_CORES"));
+            assert!(reason.contains(why), "{written:?}: {reason}");
+        }
+        let mut unlimited = Resources::default();
+        unlimited.memory_mb = Some(7629);
+        let Err(Error::InvalidSpec { reason, .. }) = resource_requirements(&unlimited, Some("3"))
+        else {
+            panic!("a request with no limit must be refused");
+        };
+        assert!(reason.contains("needs a CPU limit"), "{reason}");
+    }
+
+    #[test]
+    fn a_record_with_a_cpu_request_recreates_its_pod_with_it() {
+        let mut record = record();
+        record.resources.cpu_cores = Some(6);
+        record.resources.memory_mb = Some(7629);
+        record.cpu_request_cores = Some("3".to_owned());
+        for incarnation in [Incarnation::First, Incarnation::Recreate] {
+            if incarnation == Incarnation::Recreate {
+                record.node = Some("node-a".to_owned());
+            }
+            let pod = build_pod(&record, incarnation).expect("pod");
+            let container = &pod.spec.expect("spec").containers[0];
+            let requirements = container.resources.clone().expect("resources");
+            assert_eq!(quantity(&requirements.requests, "cpu"), "3");
+            assert_eq!(quantity(&requirements.limits, "cpu"), "6");
+        }
     }
 
     #[test]

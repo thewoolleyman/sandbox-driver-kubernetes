@@ -171,7 +171,7 @@ impl KubernetesProvider {
             return Err(Error::unsupported(Capability::LifecycleTimers));
         }
         spec.network.validate()?;
-        resource_requirements(&spec.resources)?;
+        resource_requirements(&spec.resources, self.config.cpu_request_cores.as_deref())?;
         let id = sandbox_id_for(spec);
         let working_dir = spec
             .working_directory
@@ -203,6 +203,7 @@ impl KubernetesProvider {
             service_account: self.config.service_account.clone(),
             image_pull_secrets: self.config.image_pull_secrets.clone(),
             factory: self.config.factory.clone(),
+            cpu_request_cores: self.config.cpu_request_cores.clone(),
         };
         build_network_policy(&record)?;
         crate::pod::build_pod(&record, Incarnation::First)?;
