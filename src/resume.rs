@@ -88,7 +88,13 @@ const POLL_STEP: &str = "case $d in 0.01) d=0.02 ;; 0.02) d=0.05 ;; *) d=0.1 ;; 
 /// commands whose files are removed. Stdin is the spec. Exits 0 once the
 /// command is running (now or by an earlier launch), 3 when the spec
 /// arrived truncated.
-const LAUNCH: &str = r#"umask 077
+///
+/// The driver's own control files are private (`umask 077`), but the
+/// command itself must run under the sandbox shell's umask, so the caller's
+/// umask is saved first and handed to the supervisor, which restores it
+/// right before it runs the wrapper (bd-ib-digmk2).
+const LAUNCH: &str = r#"SANDBOX_DRIVER_CALLER_UMASK=$(umask); export SANDBOX_DRIVER_CALLER_UMASK
+umask 077
 dir=$1 p=$2 fwd=$3 len=$4 sup=$5 wrap=$6
 shift 6
 for old; do rm -rf "$old".* 2>/dev/null; done
@@ -112,6 +118,7 @@ exit 0"#;
 fn supervise() -> String {
     format!(
         r#"p=$1 fwd=$2 wrap=$3
+cu=${{SANDBOX_DRIVER_CALLER_UMASK:-022}}; unset SANDBOX_DRIVER_CALLER_UMASK
 finish() {{ printf '%s\n' "$1" > "$p.status.tmp" && mv -f "$p.status.tmp" "$p.status"; exit 0; }}
 in=/dev/null feeder=
 if [ "$fwd" = 1 ]; then
@@ -130,7 +137,7 @@ if [ "$fwd" = 1 ]; then
   feeder=$!
   in="$p.fifo"
 fi
-/bin/sh -c "$wrap" sandbox-driver < "$in" >> "$p.out" 2>> "$p.err"
+(umask "$cu" && exec /bin/sh -c "$wrap" sandbox-driver) < "$in" >> "$p.out" 2>> "$p.err"
 status=$?
 if [ -n "$feeder" ]; then kill "$feeder" 2>/dev/null; fi
 rm -f "$p.fifo"
@@ -526,5 +533,76 @@ pub(crate) async fn feed_input(
                 .diagnose(unreachable(backoff.reconnects, waited))
                 .await);
         }
+    }
+}
+
+#[cfg(test)]
+mod umask_tests {
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    use super::launch_command;
+
+    /// Runs the real launch and supervise scripts with the local `/bin/sh`,
+    /// as a sandbox shell with umask 0022 would, and returns the umask the
+    /// wrapped command saw.
+    fn umask_seen_by_the_command(caller_umask: &str) -> String {
+        let dir =
+            std::env::temp_dir().join(format!("sdk-umask-{}-{}", std::process::id(), caller_umask));
+        let _ = std::fs::remove_dir_all(&dir);
+        let control = dir.to_string_lossy().into_owned();
+        let prefix = format!("{control}/c");
+        let argv = launch_command(&control, &prefix, false, 0, "umask", &[]);
+        let status = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("umask {caller_umask}; exec \"$@\" < /dev/null"))
+            .arg("caller")
+            .args(&argv)
+            .status()
+            .expect("runs the launch script");
+        assert!(status.success(), "launch exited {status}");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let status_file = format!("{prefix}.status");
+        while !std::path::Path::new(&status_file).exists() {
+            assert!(Instant::now() < deadline, "the command never finished");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let seen = std::fs::read_to_string(format!("{prefix}.out")).expect("reads stdout");
+        let _ = std::fs::remove_dir_all(&dir);
+        seen.trim().to_owned()
+    }
+
+    #[test]
+    fn the_wrapped_command_runs_under_the_callers_umask_not_the_drivers() {
+        assert_eq!(umask_seen_by_the_command("0022"), "0022");
+        assert_eq!(umask_seen_by_the_command("0002"), "0002");
+    }
+
+    #[test]
+    fn the_drivers_control_files_stay_private() {
+        let dir = std::env::temp_dir().join(format!("sdk-umask-files-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let control = dir.to_string_lossy().into_owned();
+        let prefix = format!("{control}/c");
+        let argv = launch_command(&control, &prefix, false, 0, "true", &[]);
+        let status = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("umask 0022; exec \"$@\" < /dev/null")
+            .arg("caller")
+            .args(&argv)
+            .status()
+            .expect("runs the launch script");
+        assert!(status.success());
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(format!("{prefix}.out"))
+            .expect("stdout file exists")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "control file mode {mode:o} is readable by others"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
