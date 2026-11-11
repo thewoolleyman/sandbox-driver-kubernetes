@@ -124,10 +124,12 @@ in=/dev/null feeder=
 if [ "$fwd" = 1 ]; then
   rm -f "$p.fifo"
   if ! mkfifo -m 600 "$p.fifo"; then echo 'sandbox-driver: cannot create the stdin fifo' >> "$p.err"; finish 126; fi
+  sup=$$
   (
     exec 4< "$p.in"
     d=0.01
     while :; do
+      kill -0 "$sup" 2>/dev/null || break
       if [ -e "$p.in.eof" ]; then cat <&4; break; fi
       cat <&4 || break
       sleep "$d"
@@ -570,6 +572,93 @@ mod umask_tests {
         let seen = std::fs::read_to_string(format!("{prefix}.out")).expect("reads stdout");
         let _ = std::fs::remove_dir_all(&dir);
         seen.trim().to_owned()
+    }
+
+    fn processes_carrying(marker: &str) -> Vec<(u32, u32)> {
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir("/proc").expect("test io").flatten() {
+            let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+                continue;
+            };
+            let Ok(cmdline) = std::fs::read(entry.path().join("cmdline")) else {
+                continue;
+            };
+            if !String::from_utf8_lossy(&cmdline)
+                .replace('\0', " ")
+                .contains(marker)
+            {
+                continue;
+            }
+            let ppid = std::fs::read_to_string(entry.path().join("stat"))
+                .ok()
+                .and_then(|stat| {
+                    let after = stat.rsplit_once(')')?.1.to_owned();
+                    after.split_whitespace().nth(1)?.parse::<u32>().ok()
+                })
+                .unwrap_or(0);
+            found.push((pid, ppid));
+        }
+        found
+    }
+
+    /// A supervisor that dies while its command still runs (SIGKILL, say)
+    /// must not leave its stdin feeder polling the input file forever.
+    #[test]
+    fn the_stdin_feeder_exits_when_its_supervisor_dies() {
+        let dir = std::env::temp_dir().join(format!("sdk-feeder-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let control = dir.to_string_lossy().into_owned();
+        let prefix = format!("{control}/c");
+        let wrap = format!("echo $$ > '{prefix}.wpid'; exec sleep 60");
+        let argv = launch_command(&control, &prefix, true, 0, &wrap, &[]);
+        let status = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("umask 0022; exec \"$@\" < /dev/null")
+            .arg("caller")
+            .args(&argv)
+            .status()
+            .expect("runs the launch script");
+        assert!(status.success(), "launch exited {status}");
+        let marker = format!("sandbox-driver-supervise {prefix}");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while processes_carrying(&marker).len() < 2
+            || !std::path::Path::new(&format!("{prefix}.wpid")).exists()
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the supervisor and its feeder never started"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let running = processes_carrying(&marker);
+        let pids: Vec<u32> = running.iter().map(|(pid, _)| *pid).collect();
+        let supervisor = running
+            .iter()
+            .find(|(_, ppid)| !pids.contains(ppid))
+            .map(|(pid, _)| *pid)
+            .expect("one supervisor heads the feeder");
+        Command::new("kill")
+            .args(["-KILL", &supervisor.to_string()])
+            .status()
+            .expect("test io");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !processes_carrying(&marker).is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let survivors = processes_carrying(&marker);
+        let wrapper = std::fs::read_to_string(format!("{prefix}.wpid")).unwrap_or_default();
+        for pid in survivors
+            .iter()
+            .map(|(pid, _)| pid.to_string())
+            .chain([wrapper.trim().to_owned()])
+        {
+            let _ = Command::new("kill").args(["-KILL", &pid]).status();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            survivors.is_empty(),
+            "the stdin feeder outlived its supervisor by 5 s: {survivors:?}"
+        );
     }
 
     #[test]

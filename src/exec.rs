@@ -6,7 +6,9 @@
 //! its own session and pairs it with an in-container watcher. A stop is
 //! requested by writing `term` or `kill` into a stop file through a second
 //! exec; the watcher signals the command's process group. Escalation timing
-//! belongs to the caller. Kubernetes exec takes neither a working directory
+//! belongs to the caller. The watcher also exits as soon as its wrapper shell
+//! is gone: a wrapper killed first (SIGKILL, or an OOM kill) would otherwise
+//! orphan it to poll a stop file that can never appear (bd-ib-u4fp5z). Kubernetes exec takes neither a working directory
 //! nor an environment, so the wrapper changes directory itself and the
 //! environment reaches the command as `env` arguments, never through a shell.
 //!
@@ -120,14 +122,16 @@ pub fn command_wrapper(
            if [ \"$mode\" = kill ]; then exit 137; fi\n\
            exit 143\n\
          fi\n\
+         wrapper=$$\n\
          (\n\
-           while [ ! -s \"$stop_file\" ]; do sleep {STOP_POLL_SLEEP_SECONDS}; done\n\
-           while [ ! -s \"$pid_file\" ]; do sleep {STOP_POLL_SLEEP_SECONDS}; done\n\
+           while [ ! -s \"$stop_file\" ]; do kill -0 \"$wrapper\" 2>/dev/null || exit 0; sleep {STOP_POLL_SLEEP_SECONDS}; done\n\
+           while [ ! -s \"$pid_file\" ]; do kill -0 \"$wrapper\" 2>/dev/null || exit 0; sleep {STOP_POLL_SLEEP_SECONDS}; done\n\
            child=$(cat \"$pid_file\")\n\
            mode=$(cat \"$stop_file\" 2>/dev/null)\n\
            if [ \"$mode\" != kill ]; then\n\
              kill -TERM \"-$child\" 2>/dev/null || kill -TERM \"$child\" 2>/dev/null || true\n\
              while kill -0 \"$child\" 2>/dev/null; do\n\
+               kill -0 \"$wrapper\" 2>/dev/null || exit 0\n\
                [ \"$(cat \"$stop_file\" 2>/dev/null)\" = kill ] && break\n\
                sleep {STOP_POLL_SLEEP_SECONDS}\n\
              done\n\
@@ -1177,6 +1181,182 @@ mod tests {
         assert_eq!(output.status.code(), Some(126));
         assert!(String::from_utf8_lossy(&output.stderr).contains("cannot read the command spec"));
         std::fs::remove_dir_all(&dir).expect("test io");
+    }
+
+    /// Every live process whose command line carries `marker`: the wrapper
+    /// shell and the stop-watcher subshell it forks both carry the wrapper
+    /// script, and so the scratch directory's path; the wrapped command's own
+    /// command line does not.
+    fn processes_carrying(marker: &str) -> Vec<u32> {
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir("/proc").expect("test io").flatten() {
+            let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+                continue;
+            };
+            if pid == std::process::id() {
+                continue;
+            }
+            let Ok(cmdline) = std::fs::read(entry.path().join("cmdline")) else {
+                continue;
+            };
+            if String::from_utf8_lossy(&cmdline).contains(marker) {
+                found.push(pid);
+            }
+        }
+        found
+    }
+
+    fn wait_until(limit: std::time::Duration, mut done: impl FnMut() -> bool) -> bool {
+        let start = std::time::Instant::now();
+        while start.elapsed() < limit {
+            if done() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        done()
+    }
+
+    /// Starts the wrapper on a long-running command and returns it once the
+    /// command's pid file is written, so the stop-watcher is running.
+    fn start_wrapper(dir: &std::path::Path, script: &str) -> std::process::Child {
+        let path = |name: &str| dir.join(name).to_string_lossy().into_owned();
+        std::fs::write(
+            path("cmd.spec"),
+            KubernetesExec::command_spec(
+                "/bin/sh",
+                &["-c".to_owned(), script.to_owned()],
+                &BTreeMap::new(),
+            ),
+        )
+        .expect("test io");
+        let cmd = exec_command(
+            &dir.to_string_lossy(),
+            &path("cmd.stop"),
+            &path("cmd.pid"),
+            &path("cmd.spec"),
+            false,
+        );
+        let child = std::process::Command::new(&cmd[0])
+            .args(&cmd[1..])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("test io");
+        assert!(
+            wait_until(std::time::Duration::from_secs(10), || {
+                std::fs::read_to_string(dir.join("cmd.pid")).is_ok_and(|pid| !pid.is_empty())
+            }),
+            "the wrapper never wrote the command's pid file"
+        );
+        child
+    }
+
+    /// SIGKILLs the wrapper shell, the way an exec whose wrapper dies first
+    /// ends, and returns whatever still carries the wrapper script 5 s later.
+    /// The wrapped command, orphaned too, is killed afterwards so the test
+    /// leaves nothing behind either way.
+    fn survivors_after_killing_the_wrapper(
+        dir: &std::path::Path,
+        mut wrapper: std::process::Child,
+        command_pid: &str,
+    ) -> Vec<u32> {
+        let marker = dir.to_string_lossy().into_owned();
+        wrapper.kill().expect("test io");
+        wrapper.wait().expect("test io");
+        wait_until(std::time::Duration::from_secs(5), || {
+            processes_carrying(&marker).is_empty()
+        });
+        let survivors = processes_carrying(&marker);
+        for pid in survivors
+            .iter()
+            .map(u32::to_string)
+            .chain([command_pid.to_owned()])
+        {
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", "--", &format!("-{pid}")])
+                .status();
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", &pid])
+                .status();
+        }
+        survivors
+    }
+
+    #[test]
+    fn the_stop_watcher_exits_when_its_wrapper_dies_while_the_command_runs() {
+        let dir = scratch_dir("watcher-running");
+        let wrapper = start_wrapper(&dir, "sleep 60");
+        let command_pid = std::fs::read_to_string(dir.join("cmd.pid")).expect("test io");
+        let survivors = survivors_after_killing_the_wrapper(&dir, wrapper, &command_pid);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            survivors.is_empty(),
+            "the stop-watcher outlived its wrapper by 5 s: {survivors:?}"
+        );
+    }
+
+    #[test]
+    fn the_stop_watcher_exits_when_its_wrapper_dies_while_it_waits_for_the_pid_file() {
+        let dir = scratch_dir("watcher-pid-wait");
+        let wrapper = start_wrapper(&dir, "sleep 60");
+        let command_pid = std::fs::read_to_string(dir.join("cmd.pid")).expect("test io");
+        // With the pid file gone, a stop request parks the watcher in its
+        // wait for the pid file.
+        std::fs::remove_file(dir.join("cmd.pid")).expect("test io");
+        std::fs::write(dir.join("cmd.stop"), "term").expect("test io");
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let survivors = survivors_after_killing_the_wrapper(&dir, wrapper, &command_pid);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            survivors.is_empty(),
+            "the stop-watcher outlived its wrapper by 5 s: {survivors:?}"
+        );
+    }
+
+    #[test]
+    fn the_stop_watcher_exits_when_its_wrapper_dies_while_a_stopped_command_lingers() {
+        let dir = scratch_dir("watcher-term-wait");
+        // The command ignores TERM, so after a `term` stop the watcher waits
+        // for it to exit.
+        let wrapper = start_wrapper(&dir, "trap '' TERM; sleep 60");
+        let command_pid = std::fs::read_to_string(dir.join("cmd.pid")).expect("test io");
+        std::fs::write(dir.join("cmd.stop"), "term").expect("test io");
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let survivors = survivors_after_killing_the_wrapper(&dir, wrapper, &command_pid);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            survivors.is_empty(),
+            "the stop-watcher outlived its wrapper by 5 s: {survivors:?}"
+        );
+    }
+
+    #[test]
+    fn a_stop_request_still_terminates_the_command_and_escalates_to_kill() {
+        let dir = scratch_dir("watcher-stop");
+        let wrapper = start_wrapper(&dir, "sleep 60");
+        std::fs::write(dir.join("cmd.stop"), "term").expect("test io");
+        let output = wrapper.wait_with_output().expect("test io");
+        assert_eq!(
+            output.status.code(),
+            Some(143),
+            "TERM did not end the command"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let dir = scratch_dir("watcher-kill");
+        let wrapper = start_wrapper(&dir, "trap '' TERM; while :; do sleep 0.1; done");
+        std::fs::write(dir.join("cmd.stop"), "term").expect("test io");
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        std::fs::write(dir.join("cmd.stop"), "kill").expect("test io");
+        let output = wrapper.wait_with_output().expect("test io");
+        assert_eq!(
+            output.status.code(),
+            Some(137),
+            "KILL did not end the command"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The resume tests run against [`crate::fake_api::FakeApi`]: every exec
