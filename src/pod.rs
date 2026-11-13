@@ -377,11 +377,16 @@ pub(crate) fn build_pod(record: &Record, incarnation: Incarnation) -> Result<Pod
         .user
         .as_deref()
         .and_then(|user| user.parse::<i64>().ok());
-    // The idle process ends promptly on TERM, so deleting the pod does not
-    // wait out a grace period on a PID 1 that ignores signals.
+    // The idle process IGNORES TERM and INT. The kernel delivers a signal
+    // sent from inside the container to the namespace's PID 1 only when PID 1
+    // handles it, so a handler here let an agent's `pkill -f` or `kill 1`
+    // end the sandbox (run 01M7B8BW33WQ, 2026-11-13). Ignoring rather than
+    // leaving them default also stops bash, where it is /bin/sh, from
+    // installing its own SIGINT handler while it waits. A pod delete then
+    // ends the container with SIGKILL at the termination grace period below.
     let idle = format!(
         "mkdir -p {runtime} && chmod 0700 {parent} {runtime} && \
-         trap 'exit 0' TERM INT; while :; do sleep 3600 & wait $!; done",
+         trap '' TERM INT; while :; do sleep 3600 & wait $!; done",
         parent = crate::exec::shell_quote(crate::RUNTIME_DIRECTORY_PARENT),
         runtime = crate::exec::shell_quote(crate::RUNTIME_DIRECTORY),
     );
@@ -922,6 +927,24 @@ mod tests {
         let command = container.command.clone().expect("command").join(" ");
         assert!(command.contains("rm -rf"), "{command}");
         assert!(command.contains("/workspace"), "{command}");
+    }
+
+    #[test]
+    fn the_idle_pid_1_ignores_term_and_int_rather_than_handling_them() {
+        // A handler on the namespace init is what lets a signal sent from
+        // inside the sandbox (an agent's `pkill -f`, `kill 1`) reach it; with
+        // TERM and INT ignored, the kernel drops them, and a pod delete falls
+        // to SIGKILL at the termination grace period.
+        let pod = build_pod(&record(), Incarnation::First).expect("pod");
+        let spec = pod.spec.expect("spec");
+        let command = spec.containers[0]
+            .command
+            .clone()
+            .expect("command")
+            .join(" ");
+        assert!(command.contains("trap '' TERM INT"), "{command}");
+        assert!(!command.contains("exit 0"), "{command}");
+        assert_eq!(spec.termination_grace_period_seconds, Some(5));
     }
 
     #[test]
