@@ -365,6 +365,74 @@ async fn a_sandbox_survives_the_loss_of_its_cluster_objects() {
     sandbox.delete().await.expect("deletes");
 }
 
+/// A signal sent from inside the sandbox to its PID 1 (an agent stopping its
+/// own loop with `pkill -f 'while :'`, measured 2026-11-13 on run
+/// 01M7B8BW33WQ) leaves the sandbox running, and a pod delete still ends it
+/// within the termination grace period.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_signal_to_pid_1_from_inside_the_sandbox_leaves_it_running() {
+    let Some(config) = support::config("pid1") else {
+        return;
+    };
+    let provider = KubernetesProvider::connect(config).await.expect("connects");
+    let client = provider.client().current().await;
+    support::ensure_namespace(client.clone()).await;
+    let sandbox = provider.create(&spec(), None).await.expect("creates");
+    let id = sandbox.id().as_str().to_owned();
+
+    for signal in ["TERM", "INT"] {
+        let sent = sandbox
+            .exec()
+            .run(&ExecSpec::new("/bin/sh").args(["-c", &format!("kill -{signal} 1; echo sent")]))
+            .await
+            .expect("signals PID 1");
+        assert_eq!(sent.stdout, b"sent\n", "kill -{signal} 1 ran");
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let after = sandbox
+            .exec()
+            .run(&ExecSpec::new("/bin/sh").args(["-c", "printf alive"]))
+            .await
+            .unwrap_or_else(|error| panic!("exec after SIG{signal} to PID 1: {error}"));
+        assert_eq!(after.stdout, b"alive", "the sandbox survived SIG{signal}");
+    }
+    // A pattern over the idle loop's own command line, as the agent ran it.
+    let pattern = sandbox
+        .exec()
+        .run(&ExecSpec::new("/bin/sh").args([
+            "-c",
+            "for p in /proc/[0-9]*; do tr '\\0' ' ' < $p/cmdline 2>/dev/null | grep -q 'while [:]' && kill -TERM ${p#/proc/}; done; echo swept",
+        ]))
+        .await
+        .expect("signals every process matching the idle loop");
+    assert_eq!(pattern.stdout, b"swept\n");
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    let after = sandbox
+        .exec()
+        .run(&ExecSpec::new("/bin/sh").args(["-c", "printf alive"]))
+        .await
+        .expect("exec after a pattern-selected TERM");
+    assert_eq!(
+        after.stdout, b"alive",
+        "the sandbox survived a pattern-selected TERM"
+    );
+    assert!(
+        pod(client.clone(), &id).await.is_some(),
+        "the pod is still there"
+    );
+
+    let started = std::time::Instant::now();
+    sandbox.delete().await.expect("deletes");
+    assert!(
+        pod(client, &id).await.is_none(),
+        "the pod is gone after delete"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(60),
+        "delete took {:?}",
+        started.elapsed()
+    );
+}
+
 /// Assertion 6: Petri's slash-bearing reconcile key round-trips.
 #[tokio::test(flavor = "multi_thread")]
 async fn petri_labels_round_trip_through_the_cluster() {
