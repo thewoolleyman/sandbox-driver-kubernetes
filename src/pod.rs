@@ -365,13 +365,19 @@ pub(crate) fn build_pod(record: &Record, incarnation: Incarnation) -> Result<Pod
     // tool that sizes itself from the CPU count sees the node's CPUs. A bare
     // `pytest -n auto` in a 6-CPU pod on a 32-CPU node started 32 workers and
     // OOM-killed the agent (bd-ib-vy75ws, 2026-11-13). Hand those tools the
-    // limit instead, unless the spec already sets the variable.
-    let cpu_sized = record.resources.cpu_cores.into_iter().flat_map(|cores| {
-        CPU_SIZED_ENV
-            .into_iter()
-            .filter(|name| !record.env.contains_key(*name))
-            .map(move |name| (name.to_owned(), cores.to_string()))
-    });
+    // limit instead, unless the spec already sets the variable. A zero limit
+    // sizes nothing: "0" would tell those tools there are no CPUs to use.
+    let cpu_sized = record
+        .resources
+        .cpu_cores
+        .filter(|cores| *cores > 0)
+        .into_iter()
+        .flat_map(|cores| {
+            CPU_SIZED_ENV
+                .into_iter()
+                .filter(|name| !record.env.contains_key(*name))
+                .map(move |name| (name.to_owned(), cores.to_string()))
+        });
     let env = record
         .env
         .iter()
@@ -1012,6 +1018,18 @@ mod tests {
     fn no_cpu_limit_adds_no_cpu_sizing_env() {
         let mut record = record();
         record.resources.cpu_cores = None;
+        let env = container_env(&record);
+        for name in CPU_SIZED_ENV {
+            assert!(!env.contains_key(name), "{name}: {env:?}");
+        }
+    }
+
+    #[test]
+    fn a_zero_cpu_limit_adds_no_cpu_sizing_env() {
+        // "0" in these variables would tell xdist, nproc and the test recipes
+        // to size for no CPUs at all; a zero limit sizes nothing instead.
+        let mut record = record();
+        record.resources.cpu_cores = Some(0);
         let env = container_env(&record);
         for name in CPU_SIZED_ENV {
             assert!(!env.contains_key(name), "{name}: {env:?}");
