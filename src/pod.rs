@@ -350,13 +350,36 @@ pub(crate) fn build_cleanup_pod(record: &Record, node: &str, owner: &str) -> Res
     })
 }
 
+/// pytest-xdist reads this before any CPU probe, for `-n auto` and `-n logical`.
+const XDIST_WORKERS_ENV: &str = "PYTEST_XDIST_AUTO_NUM_WORKERS";
+/// GNU `nproc` prints this when it is set.
+const OMP_THREADS_ENV: &str = "OMP_NUM_THREADS";
+/// The livespec repositories' own test recipes size their workers from this.
+const TEST_PARALLELISM_ENV: &str = "LIVESPEC_TEST_PARALLELISM";
+/// Every variable the driver sets to the pod's CPU limit, unless the spec
+/// already carries it.
+const CPU_SIZED_ENV: [&str; 3] = [XDIST_WORKERS_ENV, OMP_THREADS_ENV, TEST_PARALLELISM_ENV];
+
 pub(crate) fn build_pod(record: &Record, incarnation: Incarnation) -> Result<Pod> {
+    // A CPU limit is a CFS quota, not an affinity mask, so inside the pod every
+    // tool that sizes itself from the CPU count sees the node's CPUs. A bare
+    // `pytest -n auto` in a 6-CPU pod on a 32-CPU node started 32 workers and
+    // OOM-killed the agent (bd-ib-vy75ws, 2026-11-13). Hand those tools the
+    // limit instead, unless the spec already sets the variable.
+    let cpu_sized = record.resources.cpu_cores.into_iter().flat_map(|cores| {
+        CPU_SIZED_ENV
+            .into_iter()
+            .filter(|name| !record.env.contains_key(*name))
+            .map(move |name| (name.to_owned(), cores.to_string()))
+    });
     let env = record
         .env
         .iter()
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .chain(cpu_sized)
         .map(|(name, value)| EnvVar {
-            name: name.clone(),
-            value: Some(value.clone()),
+            name,
+            value: Some(value),
             value_from: None,
         })
         .collect::<Vec<_>>();
@@ -927,6 +950,72 @@ mod tests {
         let command = container.command.clone().expect("command").join(" ");
         assert!(command.contains("rm -rf"), "{command}");
         assert!(command.contains("/workspace"), "{command}");
+    }
+
+    fn container_env(record: &Record) -> BTreeMap<String, Option<String>> {
+        let pod = build_pod(record, Incarnation::First).expect("pod");
+        pod.spec.expect("spec").containers[0]
+            .env
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|var| (var.name, var.value))
+            .collect()
+    }
+
+    #[test]
+    fn a_cpu_limit_sizes_the_tools_that_count_cpus() {
+        // A CPU limit is a CFS quota, not an affinity mask: inside the pod
+        // `nproc` and `pytest -n auto` see the node's CPUs. The driver hands
+        // them the limit instead (bd-ib-p3g5tp).
+        let mut record = record();
+        record.resources.cpu_cores = Some(6);
+        let env = container_env(&record);
+        for name in CPU_SIZED_ENV {
+            assert_eq!(
+                env.get(name),
+                Some(&Some("6".to_owned())),
+                "{name}: {env:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_value_the_spec_carries_wins_over_the_cpu_limit() {
+        let mut record = record();
+        record.resources.cpu_cores = Some(6);
+        record
+            .env
+            .insert(XDIST_WORKERS_ENV.to_owned(), "2".to_owned());
+        record
+            .env
+            .insert(OMP_THREADS_ENV.to_owned(), "1".to_owned());
+        record
+            .env
+            .insert(TEST_PARALLELISM_ENV.to_owned(), "4".to_owned());
+        let env = container_env(&record);
+        assert_eq!(env.get(XDIST_WORKERS_ENV), Some(&Some("2".to_owned())));
+        assert_eq!(env.get(OMP_THREADS_ENV), Some(&Some("1".to_owned())));
+        assert_eq!(env.get(TEST_PARALLELISM_ENV), Some(&Some("4".to_owned())));
+        let pod = build_pod(&record, Incarnation::First).expect("pod");
+        let names = pod.spec.expect("spec").containers[0]
+            .env
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|var| CPU_SIZED_ENV.contains(&var.name.as_str()))
+            .count();
+        assert_eq!(names, 3, "each variable appears once");
+    }
+
+    #[test]
+    fn no_cpu_limit_adds_no_cpu_sizing_env() {
+        let mut record = record();
+        record.resources.cpu_cores = None;
+        let env = container_env(&record);
+        for name in CPU_SIZED_ENV {
+            assert!(!env.contains_key(name), "{name}: {env:?}");
+        }
     }
 
     #[test]

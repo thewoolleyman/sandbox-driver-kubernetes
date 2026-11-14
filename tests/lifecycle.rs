@@ -170,6 +170,37 @@ async fn requests_and_limits_equal_the_declared_resources() {
     sandbox.delete().await.expect("deletes");
 }
 
+/// Tools that size themselves from the CPU count see the pod's CPU limit,
+/// not the node's CPUs (bd-ib-p3g5tp): `nproc` prints the limit, and an
+/// exec'd command carries PYTEST_XDIST_AUTO_NUM_WORKERS at the limit.
+#[tokio::test(flavor = "multi_thread")]
+async fn tools_that_count_cpus_see_the_pods_cpu_limit() {
+    let Some(provider) = support::provider("cpucount").await else {
+        return;
+    };
+    let mut resources = Resources::default();
+    resources.cpu_cores = Some(1);
+    resources.memory_mb = Some(512);
+    let sandbox = provider
+        .create(&spec().resources(resources), None)
+        .await
+        .expect("creates");
+    let read = sandbox
+        .exec()
+        .run(&ExecSpec::new("/bin/sh").args([
+            "-c",
+            "printf '%s %s %s' \"$(nproc)\" \"$PYTEST_XDIST_AUTO_NUM_WORKERS\" \"$LIVESPEC_TEST_PARALLELISM\"",
+        ]))
+        .await
+        .expect("reads the CPU count");
+    assert_eq!(
+        String::from_utf8_lossy(&read.stdout),
+        "1 1 1",
+        "nproc, PYTEST_XDIST_AUTO_NUM_WORKERS and LIVESPEC_TEST_PARALLELISM in a 1-CPU pod"
+    );
+    sandbox.delete().await.expect("deletes");
+}
+
 /// Assertion 2b: a configured CPU request sits under the spec's CPU limit,
 /// and a request above the limit is refused before any pod exists.
 #[tokio::test(flavor = "multi_thread")]
