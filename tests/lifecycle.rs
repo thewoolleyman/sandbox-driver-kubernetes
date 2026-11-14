@@ -371,6 +371,9 @@ async fn a_sandbox_survives_the_loss_of_its_cluster_objects() {
 /// within the termination grace period.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_signal_to_pid_1_from_inside_the_sandbox_leaves_it_running() {
+    // Every exec is bounded, so a regression fails as a named step instead of
+    // hanging the job to its timeout.
+    const STEP: std::time::Duration = std::time::Duration::from_secs(120);
     let Some(config) = support::config("pid1") else {
         return;
     };
@@ -379,42 +382,54 @@ async fn a_signal_to_pid_1_from_inside_the_sandbox_leaves_it_running() {
     support::ensure_namespace(client.clone()).await;
     let sandbox = provider.create(&spec(), None).await.expect("creates");
     let id = sandbox.id().as_str().to_owned();
+    let alive = |step: String| {
+        let sandbox = &sandbox;
+        async move {
+            let after = tokio::time::timeout(
+                STEP,
+                sandbox
+                    .exec()
+                    .run(&ExecSpec::new("/bin/sh").args(["-c", "printf alive"])),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("exec after {step} did not finish within {STEP:?}"))
+            .unwrap_or_else(|error| panic!("exec after {step}: {error}"));
+            assert_eq!(after.stdout, b"alive", "the sandbox survived {step}");
+        }
+    };
 
     for signal in ["TERM", "INT"] {
-        let sent = sandbox
-            .exec()
-            .run(&ExecSpec::new("/bin/sh").args(["-c", &format!("kill -{signal} 1; echo sent")]))
-            .await
-            .expect("signals PID 1");
+        let script = format!("kill -{signal} 1; echo sent");
+        let sent = tokio::time::timeout(
+            STEP,
+            sandbox
+                .exec()
+                .run(&ExecSpec::new("/bin/sh").args(["-c", script.as_str()])),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("kill -{signal} 1 did not finish within {STEP:?}"))
+        .expect("signals PID 1");
         assert_eq!(sent.stdout, b"sent\n", "kill -{signal} 1 ran");
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        let after = sandbox
-            .exec()
-            .run(&ExecSpec::new("/bin/sh").args(["-c", "printf alive"]))
-            .await
-            .unwrap_or_else(|error| panic!("exec after SIG{signal} to PID 1: {error}"));
-        assert_eq!(after.stdout, b"alive", "the sandbox survived SIG{signal}");
+        alive(format!("SIG{signal} to PID 1")).await;
     }
-    // A pattern over the idle loop's own command line, as the agent ran it.
-    let pattern = sandbox
-        .exec()
-        .run(&ExecSpec::new("/bin/sh").args([
+    // A pattern over the idle loop's own command line, as the agent's
+    // `pkill -f` matched it. The pattern names the idle loop's full signature:
+    // a bare `while :` also matches the driver's own exec watchers, and
+    // signalling those hangs the exec, not the sandbox.
+    let pattern = tokio::time::timeout(
+        STEP,
+        sandbox.exec().run(&ExecSpec::new("/bin/sh").args([
             "-c",
-            "for p in /proc/[0-9]*; do tr '\\0' ' ' < $p/cmdline 2>/dev/null | grep -q 'while [:]' && kill -TERM ${p#/proc/}; done; echo swept",
-        ]))
-        .await
-        .expect("signals every process matching the idle loop");
+            "for p in /proc/[0-9]*; do tr '\\0' ' ' < $p/cmdline 2>/dev/null | grep -q 'while :; do sleep 3600 [&] wait' && kill -TERM ${p#/proc/}; done; echo swept",
+        ])),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("the pattern sweep did not finish within {STEP:?}"))
+    .expect("signals every process matching the idle loop");
     assert_eq!(pattern.stdout, b"swept\n");
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    let after = sandbox
-        .exec()
-        .run(&ExecSpec::new("/bin/sh").args(["-c", "printf alive"]))
-        .await
-        .expect("exec after a pattern-selected TERM");
-    assert_eq!(
-        after.stdout, b"alive",
-        "the sandbox survived a pattern-selected TERM"
-    );
+    alive("a pattern-selected TERM".to_owned()).await;
     assert!(
         pod(client.clone(), &id).await.is_some(),
         "the pod is still there"
