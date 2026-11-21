@@ -120,7 +120,7 @@ pub(crate) fn resource_requirements(
 }
 
 /// The configured memory request in MiB, checked against the limit.
-fn memory_request_mib(written: &str, limit_mib: Option<u32>) -> Result<u64> {
+fn memory_request_mib(written: &str, limit_mib: Option<u64>) -> Result<u64> {
     let refuse = |reason: String| Err(Error::invalid_spec(MEMORY_REQUEST_FIELD, reason));
     let Ok(mib) = written.trim().parse::<u64>() else {
         return refuse(format!(
@@ -136,7 +136,7 @@ fn memory_request_mib(written: &str, limit_mib: Option<u32>) -> Result<u64> {
              spec sets no resources.memory_mb"
         ));
     };
-    if mib > u64::from(limit) {
+    if mib > limit {
         return refuse(format!(
             "a memory request of {written:?} MiB exceeds the spec's memory limit of {limit} MiB \
              (resources.memory_mb)"
