@@ -59,6 +59,10 @@ pub struct Record {
     /// so a record without it is written exactly as before the field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu_request_cores: Option<String>,
+    /// The configured memory request below the limit (MiB, as written), kept
+    /// for the same reason as the CPU request. Omitted when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_request_mb: Option<String>,
 }
 
 /// The environment key under which [`Record::ambient_environment`] reports
@@ -198,7 +202,20 @@ mod tests {
             image_pull_secrets: Vec::new(),
             factory: None,
             cpu_request_cores: None,
+            memory_request_mb: None,
         }
+    }
+
+    #[test]
+    fn an_unset_memory_request_is_absent_from_the_record_and_a_set_one_round_trips() {
+        let unset = record("petri-a-l1");
+        let json = serde_json::to_value(&unset).expect("serializes");
+        assert!(json.get("memory_request_mb").is_none(), "{json}");
+        let mut set = record("petri-a-l2");
+        set.memory_request_mb = Some("4608".to_owned());
+        let back: Record =
+            serde_json::from_value(serde_json::to_value(&set).expect("serializes")).expect("loads");
+        assert_eq!(back.memory_request_mb.as_deref(), Some("4608"));
     }
 
     #[test]

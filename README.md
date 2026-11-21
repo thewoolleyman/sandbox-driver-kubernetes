@@ -19,8 +19,9 @@ pins). Fabro and Petri do not yet launch a plugin backend or forward workflow re
 - **Resources:** `cpu_cores`, `memory_mb` and `disk_mb` become pod requests **equal to** limits
   (Guaranteed QoS). A non-zero GPU request is refused, never dropped. Optionally the CPU
   request alone sits below its limit: with `cpu_request_cores` set (see Configuration), a pod
-  requests that many cores and keeps `cpu_cores` as its limit (Burstable QoS). Memory and disk
-  stay requested at their limits, and the workspace cleanup pod keeps its own fixed size.
+  requests that many cores and keeps `cpu_cores` as its limit (Burstable QoS). Likewise
+  `memory_request_mb` sets the memory request in MiB below the `memory_mb` limit. Disk stays
+  requested at its limit, and the workspace cleanup pod keeps its own fixed size.
 - **Identity:** the sandbox id is the pod name: the spec's `name` lowercased when it is a DNS
   label (Petri's `petri-<run>-l<lease>`), otherwise generated. The pod UID is never used.
 - **Workspace:** a node-local directory `<workspace_root>/<sandbox id>` mounted with `hostPath`
@@ -102,6 +103,13 @@ cleanup_timeout_secs = 300                  # how long a delete waits for its wo
 # not "3000m"), is not positive, exceeds the spec's cpu_cores, or is set while the spec
 # gives no cpu_cores refuses the create with invalid_spec, and no pod is made.
 cpu_request_cores = "3"
+# The memory a sandbox pod requests, in whole MiB, below its limit (the spec's memory_mb).
+# Unset (the default), the request equals the limit; a lower request makes the pod Burstable.
+# Also set by SANDBOX_DRIVER_KUBERNETES_MEMORY_REQUEST. Checked at sandbox create: a value
+# that is not a whole number of MiB ("4608"; not "4608Mi" or "4.5"), is not positive, exceeds
+# the spec's memory_mb, or is set while the spec gives no memory_mb refuses the create with
+# invalid_spec, and no pod is made.
+memory_request_mb = "4608"
 
 # A node-loaded AppArmor profile for sandbox pods. Needed where the kernel stacks an
 # exec'd process as `<profile>//&unconfined` (e.g. Ubuntu 26.04): the runtime default

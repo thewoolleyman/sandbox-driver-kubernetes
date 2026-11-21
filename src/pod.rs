@@ -60,15 +60,21 @@ pub(crate) enum Incarnation {
 /// in a refused CPU request.
 const CPU_REQUEST_FIELD: &str = "cpu_request_cores (SANDBOX_DRIVER_KUBERNETES_CPU_REQUEST_CORES)";
 
+/// The configuration key, and the environment variable that sets it, named
+/// in a refused memory request.
+const MEMORY_REQUEST_FIELD: &str = "memory_request_mb (SANDBOX_DRIVER_KUBERNETES_MEMORY_REQUEST)";
+
 /// Validates the spec's resources and renders them as requests equal to
 /// limits, except that a configured `cpu_request` (cores, as written) is the
-/// CPU request while `cpu_cores` stays the CPU limit. Memory and disk are
-/// always requested at their limits. A request that does not parse as a
-/// number of cores, is not positive, exceeds the limit, or has no limit to sit
-/// under is refused, never clamped.
+/// CPU request while `cpu_cores` stays the CPU limit, and a configured
+/// `memory_request` (MiB, as written) is the memory request while `memory_mb`
+/// stays the memory limit. Disk is always requested at its limit. A request
+/// that does not parse, is not positive, exceeds the limit, or has no limit to
+/// sit under is refused, never clamped.
 pub(crate) fn resource_requirements(
     resources: &Resources,
     cpu_request: Option<&str>,
+    memory_request: Option<&str>,
 ) -> Result<Option<ResourceRequirements>> {
     if resources.gpus.is_some_and(|gpus| gpus > 0) {
         return Err(Error::invalid_spec(
@@ -79,6 +85,9 @@ pub(crate) fn resource_requirements(
     }
     let request_millicores = cpu_request
         .map(|written| cpu_request_millicores(written, resources.cpu_cores))
+        .transpose()?;
+    let request_mib = memory_request
+        .map(|written| memory_request_mib(written, resources.memory_mb))
         .transpose()?;
     let mut quantities = BTreeMap::new();
     if let Some(cpu) = resources.cpu_cores {
@@ -100,11 +109,40 @@ pub(crate) fn resource_requirements(
     if let Some(millicores) = request_millicores {
         requests.insert("cpu".to_owned(), Quantity(cpu_quantity(millicores)));
     }
+    if let Some(mib) = request_mib {
+        requests.insert("memory".to_owned(), Quantity(format!("{mib}Mi")));
+    }
     Ok(Some(ResourceRequirements {
         requests: Some(requests),
         limits: Some(quantities),
         ..ResourceRequirements::default()
     }))
+}
+
+/// The configured memory request in MiB, checked against the limit.
+fn memory_request_mib(written: &str, limit_mib: Option<u32>) -> Result<u64> {
+    let refuse = |reason: String| Err(Error::invalid_spec(MEMORY_REQUEST_FIELD, reason));
+    let Ok(mib) = written.trim().parse::<u64>() else {
+        return refuse(format!(
+            "{written:?} is not a whole number of MiB (for example \"4608\")"
+        ));
+    };
+    if mib == 0 {
+        return refuse(format!("{written:?} is not a positive memory request"));
+    }
+    let Some(limit) = limit_mib else {
+        return refuse(format!(
+            "a memory request of {written:?} MiB needs a memory limit to sit under, and the \
+             spec sets no resources.memory_mb"
+        ));
+    };
+    if mib > u64::from(limit) {
+        return refuse(format!(
+            "a memory request of {written:?} MiB exceeds the spec's memory limit of {limit} MiB \
+             (resources.memory_mb)"
+        ));
+    }
+    Ok(mib)
 }
 
 /// The configured CPU request in millicores, checked against the limit.
@@ -448,6 +486,7 @@ pub(crate) fn build_pod(record: &Record, incarnation: Incarnation) -> Result<Pod
                 resources: resource_requirements(
                     &record.resources,
                     record.cpu_request_cores.as_deref(),
+                    record.memory_request_mb.as_deref(),
                 )?,
                 volume_mounts: Some(vec![VolumeMount {
                     name: "workspace".to_owned(),
@@ -888,6 +927,7 @@ mod tests {
             image_pull_secrets: Vec::new(),
             factory: Some("hp".to_owned()),
             cpu_request_cores: None,
+            memory_request_mb: None,
         }
     }
 
@@ -1059,7 +1099,7 @@ mod tests {
         let mut resources = Resources::default();
         resources.cpu_cores = Some(4);
         resources.memory_mb = Some(8192);
-        let rendered = resource_requirements(&resources, None)
+        let rendered = resource_requirements(&resources, None, None)
             .expect("ok")
             .expect("some");
         assert_eq!(rendered.requests, rendered.limits);
@@ -1067,7 +1107,7 @@ mod tests {
         assert_eq!(limits["cpu"], Quantity("4".to_owned()));
         assert_eq!(limits["memory"], Quantity("8192Mi".to_owned()));
         resources.gpus = Some(1);
-        assert!(resource_requirements(&resources, None).is_err());
+        assert!(resource_requirements(&resources, None, None).is_err());
     }
 
     fn quantity(map: &Option<BTreeMap<String, Quantity>>, key: &str) -> String {
@@ -1080,7 +1120,7 @@ mod tests {
         resources.cpu_cores = Some(6);
         resources.memory_mb = Some(7629);
         resources.disk_mb = Some(2048);
-        let rendered = resource_requirements(&resources, Some("3"))
+        let rendered = resource_requirements(&resources, Some("3"), None)
             .expect("ok")
             .expect("some");
         assert_eq!(quantity(&rendered.requests, "cpu"), "3");
@@ -1095,14 +1135,97 @@ mod tests {
         }
         assert_eq!(quantity(&rendered.requests, "memory"), "7629Mi");
         // A fractional request is millicores; one equal to the limit is allowed.
-        let fractional = resource_requirements(&resources, Some(" 2.5 "))
+        let fractional = resource_requirements(&resources, Some(" 2.5 "), None)
             .expect("ok")
             .expect("some");
         assert_eq!(quantity(&fractional.requests, "cpu"), "2500m");
-        let equal = resource_requirements(&resources, Some("6"))
+        let equal = resource_requirements(&resources, Some("6"), None)
             .expect("ok")
             .expect("some");
         assert_eq!(equal.requests, equal.limits);
+    }
+
+    #[test]
+    fn a_configured_memory_request_sits_under_the_memory_limit() {
+        let mut resources = Resources::default();
+        resources.cpu_cores = Some(6);
+        resources.memory_mb = Some(7629);
+        resources.disk_mb = Some(2048);
+        let rendered = resource_requirements(&resources, None, Some(" 4608 "))
+            .expect("ok")
+            .expect("some");
+        assert_eq!(quantity(&rendered.requests, "memory"), "4608Mi");
+        assert_eq!(quantity(&rendered.limits, "memory"), "7629Mi");
+        for key in ["cpu", "ephemeral-storage"] {
+            assert_eq!(
+                quantity(&rendered.requests, key),
+                quantity(&rendered.limits, key),
+                "{key}"
+            );
+        }
+        let unset = resource_requirements(&resources, None, None)
+            .expect("ok")
+            .expect("some");
+        assert_eq!(unset.requests, unset.limits);
+        let equal = resource_requirements(&resources, None, Some("7629"))
+            .expect("ok")
+            .expect("some");
+        assert_eq!(equal.requests, equal.limits);
+        let both = resource_requirements(&resources, Some("3"), Some("4608"))
+            .expect("ok")
+            .expect("some");
+        assert_eq!(quantity(&both.requests, "cpu"), "3");
+        assert_eq!(quantity(&both.requests, "memory"), "4608Mi");
+    }
+
+    #[test]
+    fn a_bad_memory_request_is_refused_naming_the_setting() {
+        let mut resources = Resources::default();
+        resources.cpu_cores = Some(4);
+        resources.memory_mb = Some(7629);
+        for (written, why) in [
+            ("7630", "exceeds the spec's memory limit of 7629 MiB"),
+            ("0", "not a positive memory request"),
+            ("-1", "not a whole number of MiB"),
+            ("4.5", "not a whole number of MiB"),
+            ("4608Mi", "not a whole number of MiB"),
+            ("", "not a whole number of MiB"),
+        ] {
+            let Err(Error::InvalidSpec { field, reason }) =
+                resource_requirements(&resources, None, Some(written))
+            else {
+                panic!("{written:?} must be refused");
+            };
+            assert_eq!(field, MEMORY_REQUEST_FIELD, "{written:?}");
+            assert!(field.contains("SANDBOX_DRIVER_KUBERNETES_MEMORY_REQUEST"));
+            assert!(reason.contains(why), "{written:?}: {reason}");
+        }
+        let mut unlimited = Resources::default();
+        unlimited.cpu_cores = Some(4);
+        let Err(Error::InvalidSpec { reason, .. }) =
+            resource_requirements(&unlimited, None, Some("4608"))
+        else {
+            panic!("a request with no limit must be refused");
+        };
+        assert!(reason.contains("needs a memory limit"), "{reason}");
+    }
+
+    #[test]
+    fn a_record_with_a_memory_request_recreates_its_pod_with_it() {
+        let mut record = record();
+        record.resources.cpu_cores = Some(6);
+        record.resources.memory_mb = Some(7629);
+        record.memory_request_mb = Some("4608".to_owned());
+        for incarnation in [Incarnation::First, Incarnation::Recreate] {
+            if incarnation == Incarnation::Recreate {
+                record.node = Some("node-a".to_owned());
+            }
+            let pod = build_pod(&record, incarnation).expect("pod");
+            let container = &pod.spec.expect("spec").containers[0];
+            let requirements = container.resources.clone().expect("resources");
+            assert_eq!(quantity(&requirements.requests, "memory"), "4608Mi");
+            assert_eq!(quantity(&requirements.limits, "memory"), "7629Mi");
+        }
     }
 
     #[test]
@@ -1123,7 +1246,7 @@ mod tests {
             ("inf", "not a finite number"),
         ] {
             let Err(Error::InvalidSpec { field, reason }) =
-                resource_requirements(&resources, Some(written))
+                resource_requirements(&resources, Some(written), None)
             else {
                 panic!("{written:?} must be refused");
             };
@@ -1133,7 +1256,7 @@ mod tests {
         }
         let mut unlimited = Resources::default();
         unlimited.memory_mb = Some(7629);
-        let Err(Error::InvalidSpec { reason, .. }) = resource_requirements(&unlimited, Some("3"))
+        let Err(Error::InvalidSpec { reason, .. }) = resource_requirements(&unlimited, Some("3"), None)
         else {
             panic!("a request with no limit must be refused");
         };
