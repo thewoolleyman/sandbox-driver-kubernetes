@@ -71,6 +71,12 @@ pub struct KubernetesConfig {
     /// `SANDBOX_DRIVER_KUBERNETES_CPU_REQUEST_CORES`, which a host renders
     /// per provider, so one host can size two provider kinds differently.
     pub cpu_request_cores: Option<String>,
+    /// The memory a sandbox pod requests, in whole MiB (for example "4608"),
+    /// below its limit (the spec's memory_mb). Unset, the request equals the
+    /// limit. Checked at sandbox create. Set from
+    /// `SANDBOX_DRIVER_KUBERNETES_MEMORY_REQUEST`, which a host renders per
+    /// provider, so one host can size two provider kinds differently.
+    pub memory_request_mb: Option<String>,
 }
 
 /// One topology spread constraint, in the Kubernetes field names. Its label
@@ -138,6 +144,7 @@ impl Default for KubernetesConfig {
             refresh_command: Vec::new(),
             refresh_timeout_secs: 60,
             cpu_request_cores: None,
+            memory_request_mb: None,
         }
     }
 }
@@ -226,6 +233,9 @@ impl KubernetesConfig {
         if let Some(value) = var("CPU_REQUEST_CORES") {
             self.cpu_request_cores = Some(value);
         }
+        if let Some(value) = var("MEMORY_REQUEST") {
+            self.memory_request_mb = Some(value);
+        }
         if let Some(value) = var("NODE_SELECTOR") {
             self.node_selector = value
                 .split(',')
@@ -267,6 +277,27 @@ mod tests {
         let bad: KubernetesConfig =
             toml::from_str("cpu_request_cores = \"three\"\n").expect("parses");
         assert_eq!(bad.cpu_request_cores.as_deref(), Some("three"));
+    }
+
+    #[test]
+    fn a_memory_request_is_unset_by_default_and_read_as_written() {
+        assert_eq!(KubernetesConfig::default().memory_request_mb, None);
+        let parsed: KubernetesConfig =
+            toml::from_str("memory_request_mb = \"4608\"\n").expect("parses");
+        assert_eq!(parsed.memory_request_mb.as_deref(), Some("4608"));
+    }
+
+    #[test]
+    fn the_memory_request_environment_variable_overrides_the_file() {
+        let mut config: KubernetesConfig =
+            toml::from_str("memory_request_mb = \"2048\"\n").expect("parses");
+        config.apply_env_from(|name| {
+            (name == "SANDBOX_DRIVER_KUBERNETES_MEMORY_REQUEST").then(|| "4608".to_owned())
+        });
+        assert_eq!(config.memory_request_mb.as_deref(), Some("4608"));
+        let mut unset = KubernetesConfig::default();
+        unset.apply_env_from(|_| None);
+        assert_eq!(unset.memory_request_mb, None);
     }
 
     #[test]
